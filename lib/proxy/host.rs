@@ -1,7 +1,9 @@
-use crate::proxy::Proxy;
 use crate::proxy::udp_packet_helper::UdpPacketHelper;
+use crate::proxy::{Action, Proxy};
 use anyhow::{Context, Result};
-use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, UdpPacket};
+use ipnet::Ipv4Net;
+use smoltcp::wire::{ArpPacket, EthernetFrame, EthernetProtocol, Ipv4Packet, UdpPacket};
+use std::net::Ipv4Addr;
 
 impl Proxy<'_> {
     pub(crate) fn process_frame_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Result<()> {
@@ -36,11 +38,39 @@ impl Proxy<'_> {
         }
     }
 
-    fn allowed_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+    pub(crate) fn allowed_from_host(&self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        if frame.src_addr() == self.host.gateway_mac {
+            return allowed_host_ethertype(frame);
+        }
+
+        match self.rules_mac.get(frame.src_addr().as_bytes()) {
+            Some(Action::Block) => return None,
+            Some(Action::Allow) => return allowed_host_ethertype(frame),
+            None => {}
+        }
+
         match frame.ethertype() {
-            EthernetProtocol::Arp => Some(()),
-            EthernetProtocol::Ipv4 => Some(()),
+            EthernetProtocol::Arp => {
+                let arp_pkt = ArpPacket::new_checked(frame.payload()).ok()?;
+                let source_protocol_addr: [u8; 4] =
+                    arp_pkt.source_protocol_addr().try_into().ok()?;
+
+                self.allowed_peer_ip_from_host(Ipv4Addr::from(source_protocol_addr))
+            }
+            EthernetProtocol::Ipv4 => {
+                let ipv4_pkt = Ipv4Packet::new_checked(frame.payload()).ok()?;
+                self.allowed_peer_ip_from_host(ipv4_pkt.src_addr())
+            }
             _ => None,
+        }
+    }
+
+    fn allowed_peer_ip_from_host(&self, peer_ip: Ipv4Addr) -> Option<()> {
+        let peer_net = Ipv4Net::from(peer_ip);
+
+        match self.rules.get_lpm(&peer_net).map(|(_, action)| action) {
+            Some(Action::Allow) => Some(()),
+            Some(Action::Block) | None => None,
         }
     }
 
@@ -72,5 +102,12 @@ impl Proxy<'_> {
         }
 
         self.dhcp_snooper.register_dhcp_reply(udp_pkt.payload());
+    }
+}
+
+fn allowed_host_ethertype(frame: &EthernetFrame<&[u8]>) -> Option<()> {
+    match frame.ethertype() {
+        EthernetProtocol::Arp | EthernetProtocol::Ipv4 => Some(()),
+        _ => None,
     }
 }

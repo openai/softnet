@@ -21,10 +21,16 @@ impl Proxy<'_> {
             .context("failed to write to the host")
     }
 
-    fn allowed_from_vm(&self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+    pub(crate) fn allowed_from_vm(&self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
         if frame.src_addr() != self.vm_mac_address {
             return None;
         }
+
+        let dst_mac_allowed = match self.rules_mac.get(frame.dst_addr().as_bytes()) {
+            Some(Action::Block) => return None,
+            Some(Action::Allow) => true,
+            None => false,
+        };
 
         match frame.ethertype() {
             EthernetProtocol::Arp => {
@@ -33,7 +39,7 @@ impl Proxy<'_> {
             }
             EthernetProtocol::Ipv4 => {
                 let ipv4_pkt = Ipv4Packet::new_checked(frame.payload()).ok()?;
-                self.allowed_from_vm_ipv4(ipv4_pkt)
+                self.allowed_from_vm_ipv4(ipv4_pkt, dst_mac_allowed)
             }
             _ => None,
         }
@@ -58,12 +64,20 @@ impl Proxy<'_> {
         None
     }
 
-    pub(crate) fn allowed_from_vm_ipv4(&self, ipv4_pkt: Ipv4Packet<&[u8]>) -> Option<()> {
+    pub(crate) fn allowed_from_vm_ipv4(
+        &self,
+        ipv4_pkt: Ipv4Packet<&[u8]>,
+        dst_mac_allowed: bool,
+    ) -> Option<()> {
         // Is this packet coming from VM's IP address that we've learned from DHCP snooping?
         if let Some(lease) = &self.dhcp_snooper.lease()
             && lease.valid_ip_source(ipv4_pkt.src_addr())
         {
             let dst_addr = ipv4_pkt.dst_addr();
+
+            if dst_mac_allowed {
+                return Some(());
+            }
 
             // Filter traffic based on user-specified rules first
             if !self.rules.is_empty() {

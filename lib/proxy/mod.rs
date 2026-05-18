@@ -16,6 +16,7 @@ use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
 use prefix_trie::{Prefix, PrefixMap};
 use smoltcp::wire::EthernetFrame;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::str::FromStr;
@@ -29,6 +30,7 @@ pub struct Proxy<'proxy> {
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_snooper: DhcpSnooper,
     rules: PrefixMap<Ipv4Net, Action>,
+    rules_mac: HashMap<[u8; 6], Action>,
     enobufs_encountered: bool,
     port_forwarder: PortForwarder,
 }
@@ -36,7 +38,18 @@ pub struct Proxy<'proxy> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Prefix(Ipv4Net),
+    MacAddress(MacAddress),
     Host,
+}
+
+impl Target {
+    pub fn is_ipv4_default_route(&self) -> bool {
+        matches!(self, Target::Prefix(prefix) if *prefix == Ipv4Net::zero())
+    }
+
+    pub fn is_mac_address(&self) -> bool {
+        matches!(self, Target::MacAddress(_))
+    }
 }
 
 impl FromStr for Target {
@@ -45,6 +58,10 @@ impl FromStr for Target {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         if s == "@host" {
             return Ok(Target::Host);
+        }
+
+        if let Ok(mac_address) = MacAddress::from_str(s) {
+            return Ok(Target::MacAddress(mac_address));
         }
 
         Ipv4Net::from_str(s).map(Target::Prefix)
@@ -67,10 +84,9 @@ impl Proxy<'_> {
         exposed_ports: Vec<ExposedPort>,
     ) -> Result<Proxy<'proxy>> {
         let vm = VM::new(vm_fd)?;
-        let host = Host::new(
-            vm_net_type,
-            !allow.contains(&Target::Prefix(Ipv4Net::zero())),
-        )?;
+        let enable_isolation = !allow.iter().any(Target::is_ipv4_default_route)
+            && !allow.iter().chain(block.iter()).any(Target::is_mac_address);
+        let host = Host::new(vm_net_type, enable_isolation)?;
         let poller_timeout = Duration::from_millis(100);
         let poller = Poller::new(vm.as_raw_fd(), host.as_raw_fd(), poller_timeout)?;
 
@@ -79,11 +95,17 @@ impl Proxy<'_> {
         // SECURITY: blocking rules must always take precedence
         // over allowing rules when prefixes are identical.
         let mut rules = PrefixMap::new();
+        let mut rules_mac = HashMap::new();
 
         for allow_target in allow {
             let allow_prefix = match allow_target {
                 Target::Prefix(prefix) => prefix,
                 Target::Host => host.gateway_ip.into(),
+                Target::MacAddress(mac_address) => {
+                    rules_mac.insert(mac_address.bytes(), Action::Allow);
+
+                    continue;
+                }
             };
 
             rules.insert(allow_prefix, Action::Allow);
@@ -93,6 +115,11 @@ impl Proxy<'_> {
             let block_prefix = match block_target {
                 Target::Prefix(prefix) => prefix,
                 Target::Host => host.gateway_ip.into(),
+                Target::MacAddress(mac_address) => {
+                    rules_mac.insert(mac_address.bytes(), Action::Block);
+
+                    continue;
+                }
             };
 
             rules.insert(block_prefix, Action::Block);
@@ -105,6 +132,7 @@ impl Proxy<'_> {
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
             rules,
+            rules_mac,
             enobufs_encountered: false,
             port_forwarder: PortForwarder::new(exposed_ports),
         })
@@ -316,6 +344,6 @@ mod tests {
 
         let ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_slice());
 
-        proxy.allowed_from_vm_ipv4(ipv4_pkt)
+        proxy.allowed_from_vm_ipv4(ipv4_pkt, false)
     }
 }
