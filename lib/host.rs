@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use log::info;
+use smoltcp::wire::EthernetAddress;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
@@ -28,6 +30,7 @@ pub struct Host {
     new_packets_rx: UnixDatagram,
     callback_can_continue_tx: SyncSender<()>,
     pub gateway_ip: smoltcp::wire::Ipv4Address,
+    pub gateway_mac: EthernetAddress,
     pub max_packet_size: u64,
     pub read_max_packets: u64,
     finalized: bool,
@@ -49,15 +52,42 @@ impl Host {
         .context("failed to initialize vmnet interface")?;
 
         // Retrieve first IP (gateway) used for this interface
-        let Some(Parameter::StartAddress(gateway_ip)) =
+        let Some(Parameter::StartAddress(start_address)) =
             interface.parameters().get(ParameterKind::StartAddress)
         else {
             return Err(anyhow!(
                 "failed to retrieve vmnet's interface start address"
             ));
         };
-        let gateway_ip = Ipv4Addr::from_str(&gateway_ip)
+        let start_address = Ipv4Addr::from_str(&start_address)
             .context("failed to parse vmnet's interface start address")?;
+
+        // Retrieve last IP used for this interface and calculate the prefix
+        let Some(Parameter::EndAddress(end_address)) =
+            interface.parameters().get(ParameterKind::EndAddress)
+        else {
+            return Err(anyhow!("failed to retrieve vmnet's interface end address"));
+        };
+        let end_address = Ipv4Addr::from_str(&end_address)
+            .context("failed to parse vmnet's interface end address")?;
+
+        let Some(prefix) = Self::ipv4_range_prefix(start_address, end_address) else {
+            return Err(anyhow!(
+                "failed to resolve vmnet's interface: prefix ambiguity for {}–{}",
+                start_address,
+                end_address
+            ));
+        };
+
+        // Figure out the gateway's interface MAC address
+        let Some(gateway_mac) = Self::interface_mac_for_ip(start_address, prefix) else {
+            return Err(anyhow!(
+                "failed to resolve vmnet's interface: no interface found with {}/{} CIDR",
+                start_address,
+                prefix
+            ));
+        };
+        let gateway_mac = EthernetAddress(gateway_mac.octets());
 
         // Retrieve max packet size for this interface
         let Some(Parameter::MaxPacketSize(max_packet_size)) =
@@ -104,11 +134,38 @@ impl Host {
             interface,
             new_packets_rx,
             callback_can_continue_tx,
-            gateway_ip,
+            gateway_ip: start_address,
+            gateway_mac,
             max_packet_size,
             read_max_packets,
             finalized: false,
         })
+    }
+
+    fn interface_mac_for_ip(ip: Ipv4Addr, prefix: u8) -> Option<pnet_datalink::MacAddr> {
+        for iface in pnet_datalink::interfaces() {
+            if iface
+                .ips
+                .iter()
+                .any(|network| network.ip() == IpAddr::V4(ip) && network.prefix() == prefix)
+                && let Some(mac) = iface.mac
+            {
+                return Some(mac);
+            }
+        }
+
+        None
+    }
+
+    fn ipv4_range_prefix(start_address: Ipv4Addr, end_address: Ipv4Addr) -> Option<u8> {
+        let start_address = start_address.to_bits();
+        let end_address = end_address.to_bits();
+
+        if start_address > end_address {
+            return None;
+        }
+
+        Some((start_address ^ end_address).leading_zeros() as u8)
     }
 }
 
@@ -196,5 +253,60 @@ impl Drop for Host {
 impl AsRawFd for Host {
     fn as_raw_fd(&self) -> RawFd {
         self.new_packets_rx.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Host;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_range_prefix_for_class_c_subnet() {
+        assert_eq!(
+            Host::ipv4_range_prefix(
+                Ipv4Addr::new(192, 168, 64, 0),
+                Ipv4Addr::new(192, 168, 64, 255),
+            ),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn ipv4_range_prefix_for_single_address() {
+        assert_eq!(
+            Host::ipv4_range_prefix(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 1)),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn ipv4_range_prefix_for_class_c_usable_range() {
+        assert_eq!(
+            Host::ipv4_range_prefix(
+                Ipv4Addr::new(192, 168, 64, 1),
+                Ipv4Addr::new(192, 168, 64, 254),
+            ),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn ipv4_range_prefix_for_containing_class_c_subnet() {
+        assert_eq!(
+            Host::ipv4_range_prefix(
+                Ipv4Addr::new(192, 168, 64, 2),
+                Ipv4Addr::new(192, 168, 64, 254),
+            ),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn ipv4_range_prefix_rejects_inverted_range() {
+        assert_eq!(
+            Host::ipv4_range_prefix(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1)),
+            None
+        );
     }
 }

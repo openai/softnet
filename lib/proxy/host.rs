@@ -37,6 +37,14 @@ impl Proxy<'_> {
     }
 
     fn allowed_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        let from_gateway = frame.src_addr() == self.host.gateway_mac;
+        let peer_action = self.rules_mac.get(frame.src_addr().as_bytes());
+        let from_allowed_peer = peer_action == Some(&crate::proxy::Action::Allow);
+
+        if !from_gateway && !from_allowed_peer {
+            return None;
+        }
+
         match frame.ethertype() {
             EthernetProtocol::Arp => Some(()),
             EthernetProtocol::Ipv4 => Some(()),

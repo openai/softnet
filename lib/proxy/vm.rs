@@ -4,7 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use ipnet::Ipv4Net;
 use smoltcp::wire::{
-    ArpPacket, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, UdpPacket,
+    ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, UdpPacket,
 };
 use std::net::Ipv4Addr;
 
@@ -29,18 +29,26 @@ impl Proxy<'_> {
         match frame.ethertype() {
             EthernetProtocol::Arp => {
                 let arp_pkt = ArpPacket::new_checked(frame.payload()).ok()?;
-                self.allowed_from_vm_arp(arp_pkt)
+                self.allowed_from_vm_arp(arp_pkt, frame.dst_addr())
             }
             EthernetProtocol::Ipv4 => {
                 let ipv4_pkt = Ipv4Packet::new_checked(frame.payload()).ok()?;
-                self.allowed_from_vm_ipv4(ipv4_pkt)
+                self.allowed_from_vm_ipv4(ipv4_pkt, frame.dst_addr())
             }
             _ => None,
         }
     }
 
-    fn allowed_from_vm_arp(&self, arp_pkt: ArpPacket<&[u8]>) -> Option<()> {
+    fn allowed_from_vm_arp(
+        &self,
+        arp_pkt: ArpPacket<&[u8]>,
+        dst_mac: EthernetAddress,
+    ) -> Option<()> {
         if arp_pkt.source_hardware_addr() != self.vm_mac_address.0 {
+            return None;
+        }
+
+        if self.rules_mac.get(dst_mac.as_bytes()) == Some(&Action::Block) {
             return None;
         }
 
@@ -58,12 +66,22 @@ impl Proxy<'_> {
         None
     }
 
-    pub(crate) fn allowed_from_vm_ipv4(&self, ipv4_pkt: Ipv4Packet<&[u8]>) -> Option<()> {
+    pub(crate) fn allowed_from_vm_ipv4(
+        &self,
+        ipv4_pkt: Ipv4Packet<&[u8]>,
+        dst_mac: EthernetAddress,
+    ) -> Option<()> {
         // Is this packet coming from VM's IP address that we've learned from DHCP snooping?
         if let Some(lease) = &self.dhcp_snooper.lease()
             && lease.valid_ip_source(ipv4_pkt.src_addr())
         {
             let dst_addr = ipv4_pkt.dst_addr();
+
+            match self.rules_mac.get(dst_mac.as_bytes()) {
+                Some(Action::Block) => return None,
+                Some(Action::Allow) => return Some(()),
+                None => {}
+            }
 
             // Filter traffic based on user-specified rules first
             if !self.rules.is_empty() {
