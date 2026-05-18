@@ -59,7 +59,7 @@ struct Args {
         In case an identical prefix is both --allow'ed and --block'ed, \
         blocking will take precedence. --allow=0.0.0.0/0 is a special case, \
         it additionally disables bridge isolation (even when --block=0.0.0.0/0 is specified).",
-        value_name = "comma-separated CIDRs or @-alias",
+        value_name = "comma-separated CIDRs, MAC addresses or @-aliases",
         use_value_delimiter = true,
         action = clap::ArgAction::Set
     )]
@@ -74,7 +74,7 @@ struct Args {
         When used with --allow, the longest prefix match always wins. \
         In case an identical prefix is both --allow'ed and --block'ed, \
         blocking will take precedence.",
-        value_name = "comma-separated CIDRs or @-alias",
+        value_name = "comma-separated CIDRs, MAC addresses or @-aliases",
         use_value_delimiter = true,
         action = clap::ArgAction::Set
     )]

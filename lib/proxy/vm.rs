@@ -65,6 +65,18 @@ impl Proxy<'_> {
         {
             let dst_addr = ipv4_pkt.dst_addr();
 
+            if self.rules_mac.iter().any(|(mac, action)| {
+                *action == Action::Block && self.dhcp_snooper_global.valid_ip_for_mac(mac, dst_addr)
+            }) {
+                return None;
+            }
+
+            if self.rules_mac.iter().any(|(mac, action)| {
+                *action == Action::Allow && self.dhcp_snooper_global.valid_ip_for_mac(mac, dst_addr)
+            }) {
+                return Some(());
+            }
+
             // Filter traffic based on user-specified rules first
             if !self.rules.is_empty() {
                 let dst_net = Ipv4Net::from(dst_addr);

@@ -5,6 +5,7 @@ mod udp_packet_helper;
 mod vm;
 
 use crate::dhcp_snooper::DhcpSnooper;
+use crate::dhcp_snooper_global::DhcpSnooperGlobal;
 use crate::host::Host;
 use crate::host::NetType;
 use crate::poller::Poller;
@@ -16,6 +17,7 @@ use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
 use prefix_trie::{Prefix, PrefixMap};
 use smoltcp::wire::EthernetFrame;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::str::FromStr;
@@ -28,7 +30,9 @@ pub struct Proxy<'proxy> {
     poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_snooper: DhcpSnooper,
+    dhcp_snooper_global: DhcpSnooperGlobal,
     rules: PrefixMap<Ipv4Net, Action>,
+    rules_mac: HashMap<[u8; 6], Action>,
     enobufs_encountered: bool,
     port_forwarder: PortForwarder,
 }
@@ -36,6 +40,7 @@ pub struct Proxy<'proxy> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Prefix(Ipv4Net),
+    MacAddress(MacAddress),
     Host,
 }
 
@@ -45,6 +50,10 @@ impl FromStr for Target {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         if s == "@host" {
             return Ok(Target::Host);
+        }
+
+        if let Ok(mac_address) = MacAddress::from_str(s) {
+            return Ok(Target::MacAddress(mac_address));
         }
 
         Ipv4Net::from_str(s).map(Target::Prefix)
@@ -66,24 +75,44 @@ impl Proxy<'_> {
         block: Vec<Target>,
         exposed_ports: Vec<ExposedPort>,
     ) -> Result<Proxy<'proxy>> {
+        let allowing_all_ipv4 = allow.contains(&Target::Prefix(Ipv4Net::zero()));
+        let using_mac_filtering = allow
+            .iter()
+            .chain(block.iter())
+            .any(|target| matches!(target, Target::MacAddress(_)));
+        let enable_isolation = !allowing_all_ipv4 && !using_mac_filtering;
+
         let vm = VM::new(vm_fd)?;
-        let host = Host::new(
-            vm_net_type,
-            !allow.contains(&Target::Prefix(Ipv4Net::zero())),
-        )?;
+        let host = Host::new(vm_net_type, enable_isolation)?;
         let poller_timeout = Duration::from_millis(100);
-        let poller = Poller::new(vm.as_raw_fd(), host.as_raw_fd(), poller_timeout)?;
+        let dhcp_snooper_global = if using_mac_filtering {
+            DhcpSnooperGlobal::new(&host.gateway_interface_name, poller_timeout)?
+        } else {
+            DhcpSnooperGlobal::disabled(poller_timeout)
+        };
+        let poller = Poller::new(
+            vm.as_raw_fd(),
+            host.as_raw_fd(),
+            dhcp_snooper_global.pcap_raw_fd(),
+            poller_timeout,
+        )?;
 
         // Craft packet filter rules
         //
         // SECURITY: blocking rules must always take precedence
         // over allowing rules when prefixes are identical.
         let mut rules = PrefixMap::new();
+        let mut rules_mac = HashMap::new();
 
         for allow_target in allow {
             let allow_prefix = match allow_target {
                 Target::Prefix(prefix) => prefix,
                 Target::Host => host.gateway_ip.into(),
+                Target::MacAddress(mac_address) => {
+                    rules_mac.insert(mac_address.bytes(), Action::Allow);
+
+                    continue;
+                }
             };
 
             rules.insert(allow_prefix, Action::Allow);
@@ -93,6 +122,11 @@ impl Proxy<'_> {
             let block_prefix = match block_target {
                 Target::Prefix(prefix) => prefix,
                 Target::Host => host.gateway_ip.into(),
+                Target::MacAddress(mac_address) => {
+                    rules_mac.insert(mac_address.bytes(), Action::Block);
+
+                    continue;
+                }
             };
 
             rules.insert(block_prefix, Action::Block);
@@ -104,7 +138,9 @@ impl Proxy<'_> {
             poller,
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
+            dhcp_snooper_global,
             rules,
+            rules_mac,
             enobufs_encountered: false,
             port_forwarder: PortForwarder::new(exposed_ports),
         })
@@ -124,26 +160,36 @@ impl Proxy<'_> {
         self.poller.arm()?;
 
         loop {
-            let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
+            let readiness = self.poller.wait()?;
 
             // Update coarse time for the DHCP snooper
             coarsetime::Instant::update();
 
-            if vm_readable {
+            if readiness.vm_readable {
                 self.read_from_vm(buf.as_mut_slice())?;
             }
 
-            if host_readable {
+            if readiness.host_readable {
                 self.read_from_host(&mut batch, &mut bufs)?;
             }
 
+            if readiness.pcap_readable {
+                self.dhcp_snooper_global
+                    .read_pcap(|snooper, packet| snooper.register_ethernet_packet(packet))?;
+            }
+            self.dhcp_snooper_global.print_table_periodically();
+
             // Graceful termination
-            if interrupt {
+            if readiness.interrupt {
                 return Ok(());
             }
 
             // Timeout
-            if !vm_readable && !host_readable && !interrupt {
+            if !readiness.vm_readable
+                && !readiness.host_readable
+                && !readiness.pcap_readable
+                && !readiness.interrupt
+            {
                 self.port_forwarder
                     .tick(&mut self.host, self.dhcp_snooper.lease());
             }

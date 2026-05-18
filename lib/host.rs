@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
+use ipnetwork::{IpNetwork, Ipv4Network};
 use log::info;
+use pnet_datalink::MacAddr;
+use smoltcp::wire::EthernetAddress;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
@@ -27,7 +30,9 @@ pub struct Host {
     interface: vmnet::Interface,
     new_packets_rx: UnixDatagram,
     callback_can_continue_tx: SyncSender<()>,
+    pub gateway_interface_name: String,
     pub gateway_ip: smoltcp::wire::Ipv4Address,
+    pub gateway_mac: EthernetAddress,
     pub max_packet_size: u64,
     pub read_max_packets: u64,
     finalized: bool,
@@ -48,16 +53,37 @@ impl Host {
         )
         .context("failed to initialize vmnet interface")?;
 
-        // Retrieve first IP (gateway) used for this interface
-        let Some(Parameter::StartAddress(gateway_ip)) =
+        // Retrieve the first IP (gateway) used for this interface
+        let Some(Parameter::StartAddress(start_address)) =
             interface.parameters().get(ParameterKind::StartAddress)
         else {
             return Err(anyhow!(
                 "failed to retrieve vmnet's interface start address"
             ));
         };
-        let gateway_ip = Ipv4Addr::from_str(&gateway_ip)
+        let start_address = Ipv4Addr::from_str(&start_address)
             .context("failed to parse vmnet's interface start address")?;
+
+        // Retrieve the last IP used for this interface
+        let Some(Parameter::EndAddress(end_address)) =
+            interface.parameters().get(ParameterKind::EndAddress)
+        else {
+            return Err(anyhow!("failed to retrieve vmnet's interface end address"));
+        };
+        let end_address = Ipv4Addr::from_str(&end_address)
+            .context("failed to parse vmnet's interface end address")?;
+
+        // Determine the prefix used for this interface
+        let prefix = Self::ipv4_range_prefix(start_address, end_address);
+
+        let Some((gateway_name, gateway_mac)) = Self::interface_ip_to_mac(start_address, prefix)
+        else {
+            return Err(anyhow!(
+                "failed to resolve vmnet's interface from start address {}",
+                start_address
+            ));
+        };
+        let gateway_mac = EthernetAddress(gateway_mac.octets());
 
         // Retrieve max packet size for this interface
         let Some(Parameter::MaxPacketSize(max_packet_size)) =
@@ -104,11 +130,31 @@ impl Host {
             interface,
             new_packets_rx,
             callback_can_continue_tx,
-            gateway_ip,
+            gateway_interface_name: gateway_name,
+            gateway_ip: start_address,
+            gateway_mac,
             max_packet_size,
             read_max_packets,
             finalized: false,
         })
+    }
+
+    fn interface_ip_to_mac(ip: Ipv4Addr, prefix: u8) -> Option<(String, MacAddr)> {
+        let ip_network = IpNetwork::V4(Ipv4Network::new(ip, prefix).unwrap());
+
+        for iface in pnet_datalink::interfaces() {
+            if iface.ips.contains(&ip_network)
+                && let Some(mac) = iface.mac
+            {
+                return Some((iface.name, mac));
+            }
+        }
+
+        None
+    }
+
+    fn ipv4_range_prefix(start_address: Ipv4Addr, end_address: Ipv4Addr) -> u8 {
+        (u32::from(start_address) ^ u32::from(end_address)).leading_zeros() as u8
     }
 }
 
@@ -196,5 +242,30 @@ impl Drop for Host {
 impl AsRawFd for Host {
     fn as_raw_fd(&self) -> RawFd {
         self.new_packets_rx.as_raw_fd()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Host;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ipv4_range_prefix_for_vmnet_class_c_range() {
+        assert_eq!(
+            Host::ipv4_range_prefix(
+                Ipv4Addr::new(192, 168, 64, 1),
+                Ipv4Addr::new(192, 168, 64, 254),
+            ),
+            24
+        );
+    }
+
+    #[test]
+    fn ipv4_range_prefix_for_single_address() {
+        assert_eq!(
+            Host::ipv4_range_prefix(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 1)),
+            32
+        );
     }
 }

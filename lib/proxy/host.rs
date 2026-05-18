@@ -37,6 +37,29 @@ impl Proxy<'_> {
     }
 
     fn allowed_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        // let mac = frame
+        //     .src_addr()
+        //     .as_bytes()
+        //     .iter()
+        //     .map(|b| format!("{:02x}", b))
+        //     .collect::<Vec<_>>()
+        //     .join(":");
+        //
+        // println!("{}", mac);
+
+        let from_gateway = frame.src_addr() == self.host.gateway_mac;
+        let peer_action = self.rules_mac.get(frame.src_addr().as_bytes());
+        let from_allowed_peer = peer_action == Some(&crate::proxy::Action::Allow);
+
+        if !from_gateway && !from_allowed_peer {
+            println!("dropping packet from {}", frame.src_addr());
+            return None;
+        }
+
+        if from_allowed_peer {
+            println!("allowing packet from peer {}", frame.src_addr());
+        }
+
         match frame.ethertype() {
             EthernetProtocol::Arp => Some(()),
             EthernetProtocol::Ipv4 => Some(()),
@@ -45,6 +68,8 @@ impl Proxy<'_> {
     }
 
     fn snoop(&mut self, frame: &EthernetFrame<&[u8]>) {
+        // TODO: resolve IPs for the MAC addresses from --allow/--block too
+
         if frame.ethertype() != EthernetProtocol::Ipv4 {
             return;
         }
