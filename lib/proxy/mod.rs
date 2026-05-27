@@ -42,6 +42,16 @@ pub enum Target {
     Host,
 }
 
+impl Target {
+    pub fn is_ipv4_default_route(&self) -> bool {
+        matches!(self, Target::Prefix(prefix) if *prefix == Ipv4Net::zero())
+    }
+
+    pub fn is_mac_address(&self) -> bool {
+        matches!(self, Target::MacAddress(_))
+    }
+}
+
 impl FromStr for Target {
     type Err = ipnet::AddrParseError;
 
@@ -69,17 +79,11 @@ impl Proxy<'_> {
         vm_fd: RawFd,
         vm_mac_address: MacAddress,
         vm_net_type: NetType,
+        enable_isolation: bool,
         allow: Vec<Target>,
         block: Vec<Target>,
         exposed_ports: Vec<ExposedPort>,
     ) -> Result<Proxy<'proxy>> {
-        let allowing_all_ipv4 = allow.contains(&Target::Prefix(Ipv4Net::zero()));
-        let using_mac_filtering = allow
-            .iter()
-            .chain(block.iter())
-            .any(|target| matches!(target, Target::MacAddress(_)));
-        let enable_isolation = !allowing_all_ipv4 && !using_mac_filtering;
-
         let vm = VM::new(vm_fd)?;
         let host = Host::new(vm_net_type, enable_isolation)?;
         let poller_timeout = Duration::from_millis(100);
@@ -226,7 +230,7 @@ impl Proxy<'_> {
 mod tests {
     use crate::NetType;
     use crate::dhcp_snooper::Lease;
-    use crate::proxy::{Action, Proxy};
+    use crate::proxy::{Action, Proxy, Target};
     use ipnet::Ipv4Net;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -329,18 +333,24 @@ mod tests {
         .unwrap();
         let vm_fd = Box::leak(Box::new(vm_fd));
 
+        let allow: Vec<Target> = allow
+            .into_iter()
+            .map(|cidr| cidr.parse().unwrap())
+            .collect();
+        let block: Vec<Target> = block
+            .into_iter()
+            .map(|cidr| cidr.parse().unwrap())
+            .collect();
+        let enable_isolation = !allow.iter().any(Target::is_ipv4_default_route)
+            && !allow.iter().chain(block.iter()).any(Target::is_mac_address);
+
         let mut proxy = Proxy::new(
             vm_fd.as_raw_fd(),
             MacAddress::from_str("02:00:00:00:00:01").unwrap(),
             NetType::Nat,
-            allow
-                .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
-                .collect(),
-            block
-                .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
-                .collect(),
+            enable_isolation,
+            allow,
+            block,
             Vec::default(),
         )
         .unwrap();

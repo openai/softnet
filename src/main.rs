@@ -194,11 +194,14 @@ fn try_main() -> anyhow::Result<()> {
     // Set bootpd(8) min/max lease time while still having the root privileges
     set_bootpd_lease_time(args.bootpd_lease_time);
 
+    let enable_isolation = bridge_isolation_enabled(&args.allow, &args.block);
+
     // Initialize the proxy while still having the root privileges
     let mut proxy = Proxy::new(
         args.vm_fd as RawFd,
         args.vm_mac_address,
         args.vm_net_type,
+        enable_isolation,
         args.allow,
         args.block,
         args.expose,
@@ -231,6 +234,14 @@ fn sudo_escalation_works() -> bool {
         .unwrap_or(false)
 }
 
+fn bridge_isolation_enabled(allow: &[Target], block: &[Target]) -> bool {
+    let disables_isolation_for_compat = allow.iter().any(Target::is_ipv4_default_route);
+    let disables_isolation_for_mac_filtering =
+        allow.iter().chain(block.iter()).any(Target::is_mac_address);
+
+    !(disables_isolation_for_compat || disables_isolation_for_mac_filtering)
+}
+
 fn set_bootpd_lease_time(lease_time: u32) {
     let prefs = SCPreferences::group(
         &CFString::new("softnet"),
@@ -250,5 +261,46 @@ fn set_bootpd_lease_time(lease_time: u32) {
         );
 
         SCPreferencesCommitChanges(prefs.as_concrete_TypeRef());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn targets(values: &[&str]) -> Vec<Target> {
+        values.iter().map(|value| value.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn bridge_isolation_disabled_for_legacy_allow_default_route() {
+        assert!(!bridge_isolation_enabled(
+            &targets(&["0.0.0.0/0"]),
+            &targets(&[])
+        ));
+    }
+
+    #[test]
+    fn bridge_isolation_disabled_for_legacy_allow_default_route_even_when_blocked() {
+        assert!(!bridge_isolation_enabled(
+            &targets(&["0.0.0.0/0"]),
+            &targets(&["0.0.0.0/0"])
+        ));
+    }
+
+    #[test]
+    fn bridge_isolation_kept_for_block_default_route_only() {
+        assert!(bridge_isolation_enabled(
+            &targets(&[]),
+            &targets(&["0.0.0.0/0"])
+        ));
+    }
+
+    #[test]
+    fn bridge_isolation_disabled_for_mac_filtering() {
+        assert!(!bridge_isolation_enabled(
+            &targets(&[]),
+            &targets(&["02:00:00:00:00:02"])
+        ));
     }
 }
