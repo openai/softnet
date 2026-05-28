@@ -4,7 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use ipnet::Ipv4Net;
 use smoltcp::wire::{
-    ArpPacket, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, UdpPacket,
+    ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, UdpPacket,
 };
 use std::net::Ipv4Addr;
 
@@ -26,6 +26,22 @@ impl Proxy<'_> {
             return None;
         }
 
+        // When peers are set the isolation between VMs is disabled,
+        // so we need to be stricter about what we'll emit
+        if !self.peer_mac_addresses.is_empty() {
+            // Destination check
+            let to_gateway = Some(frame.dst_addr()) == self.host.gateway_mac;
+            let to_peer = self.peer_mac_addresses.contains(&frame.dst_addr());
+
+            if !to_gateway
+                && !to_peer
+                && !frame.dst_addr().is_broadcast()
+                && !frame.dst_addr().is_multicast()
+            {
+                return None;
+            }
+        }
+
         match frame.ethertype() {
             EthernetProtocol::Arp => {
                 let arp_pkt = ArpPacket::new_checked(frame.payload()).ok()?;
@@ -33,7 +49,7 @@ impl Proxy<'_> {
             }
             EthernetProtocol::Ipv4 => {
                 let ipv4_pkt = Ipv4Packet::new_checked(frame.payload()).ok()?;
-                self.allowed_from_vm_ipv4(ipv4_pkt)
+                self.allowed_from_vm_ipv4(ipv4_pkt, frame.dst_addr())
             }
             _ => None,
         }
@@ -58,12 +74,21 @@ impl Proxy<'_> {
         None
     }
 
-    pub(crate) fn allowed_from_vm_ipv4(&self, ipv4_pkt: Ipv4Packet<&[u8]>) -> Option<()> {
+    pub(crate) fn allowed_from_vm_ipv4(
+        &self,
+        ipv4_pkt: Ipv4Packet<&[u8]>,
+        dst_mac: EthernetAddress,
+    ) -> Option<()> {
         // Is this packet coming from VM's IP address that we've learned from DHCP snooping?
         if let Some(lease) = &self.dhcp_snooper.lease()
             && lease.valid_ip_source(ipv4_pkt.src_addr())
         {
             let dst_addr = ipv4_pkt.dst_addr();
+
+            // Communication with peers bypasses IP rules
+            if self.peer_mac_addresses.contains(&dst_mac) {
+                return Some(());
+            }
 
             // Filter traffic based on user-specified rules first
             if !self.rules.is_empty() {

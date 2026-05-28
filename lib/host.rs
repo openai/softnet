@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use log::info;
+use smoltcp::wire::EthernetAddress;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
@@ -28,14 +29,17 @@ pub struct Host {
     new_packets_rx: UnixDatagram,
     callback_can_continue_tx: SyncSender<()>,
     pub gateway_ip: smoltcp::wire::Ipv4Address,
+    pub gateway_mac: Option<EthernetAddress>,
     pub max_packet_size: u64,
     pub read_max_packets: u64,
     finalized: bool,
 }
 
 impl Host {
-    pub fn new(vm_net_type: NetType, enable_isolation: bool) -> Result<Host> {
-        // Initialize a vmnet.framework NAT or Host interface with isolation enabled
+    pub fn new(vm_net_type: NetType, zero_cidr_allowed: bool, has_peers: bool) -> Result<Host> {
+        // Initialize vmnet.framework's NAT or Host interface
+        let enable_isolation = !zero_cidr_allowed && !has_peers;
+
         let mut interface = vmnet::Interface::new(
             match vm_net_type {
                 NetType::Nat => Mode::Shared(Default::default()),
@@ -58,6 +62,35 @@ impl Host {
         };
         let gateway_ip = Ipv4Addr::from_str(&gateway_ip)
             .context("failed to parse vmnet's interface start address")?;
+
+        // Determine gateway's MAC address in case we have any peers
+        let mut gateway_mac: Option<EthernetAddress> = None;
+
+        if has_peers {
+            for iface in pnet_datalink::interfaces() {
+                if !iface.ips.iter().any(|ip| ip.ip() == gateway_ip) {
+                    continue;
+                }
+
+                if gateway_mac.is_some() {
+                    return Err(anyhow!(
+                        "cannot enforce peers: multiple host interfaces have vmnet gateway IP {}",
+                        gateway_ip
+                    ));
+                }
+
+                if let Some(iface_mac) = iface.mac {
+                    gateway_mac = Some(EthernetAddress(iface_mac.octets()));
+                }
+            }
+
+            if gateway_mac.is_none() {
+                return Err(anyhow!(
+                    "cannot enforce peers: no host interface has vmnet gateway IP {}",
+                    gateway_ip
+                ));
+            }
+        }
 
         // Retrieve max packet size for this interface
         let Some(Parameter::MaxPacketSize(max_packet_size)) =
@@ -105,6 +138,7 @@ impl Host {
             new_packets_rx,
             callback_can_continue_tx,
             gateway_ip,
+            gateway_mac,
             max_packet_size,
             read_max_packets,
             finalized: false,

@@ -6,6 +6,7 @@ use oslog::OsLogger;
 use privdrop::PrivDrop;
 use softnet::NetType;
 use softnet::proxy::ExposedPort;
+use softnet::proxy::Peer;
 use softnet::proxy::Proxy;
 use softnet::proxy::Target;
 use std::borrow::Cow;
@@ -79,6 +80,16 @@ struct Args {
         action = clap::ArgAction::Set
     )]
     block: Vec<Target>,
+
+    #[clap(
+        long = "peer",
+        help = "Comma-separated list of MAC addresses of the peer VMs to allow the traffic to \
+        (e.g. --peer=AA:BB:CC:DD:EE:FF)",
+        value_name = "comma-separated MAC addresses",
+        use_value_delimiter = true,
+        action = clap::ArgAction::Set
+    )]
+    peers: Vec<Peer>,
 
     #[clap(
         long,
@@ -201,6 +212,7 @@ fn try_main() -> anyhow::Result<()> {
         args.vm_net_type,
         args.allow,
         args.block,
+        args.peers,
         args.expose,
     )
     .context("failed to initialize proxy")?;

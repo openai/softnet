@@ -15,7 +15,9 @@ use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
 use prefix_trie::{Prefix, PrefixMap};
+use smoltcp::wire::EthernetAddress;
 use smoltcp::wire::EthernetFrame;
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::str::FromStr;
@@ -27,6 +29,7 @@ pub struct Proxy<'proxy> {
     host: Host,
     poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
+    peer_mac_addresses: HashSet<EthernetAddress>,
     dhcp_snooper: DhcpSnooper,
     rules: PrefixMap<Ipv4Net, Action>,
     enobufs_encountered: bool,
@@ -51,6 +54,23 @@ impl FromStr for Target {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Peer {
+    mac_address: EthernetAddress,
+}
+
+impl FromStr for Peer {
+    type Err = mac_address::MacParseError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mac_address = MacAddress::from_str(s)?;
+
+        Ok(Peer {
+            mac_address: EthernetAddress(mac_address.bytes()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Action {
     Block,
@@ -64,12 +84,14 @@ impl Proxy<'_> {
         vm_net_type: NetType,
         allow: Vec<Target>,
         block: Vec<Target>,
+        peers: Vec<Peer>,
         exposed_ports: Vec<ExposedPort>,
     ) -> Result<Proxy<'proxy>> {
         let vm = VM::new(vm_fd)?;
         let host = Host::new(
             vm_net_type,
-            !allow.contains(&Target::Prefix(Ipv4Net::zero())),
+            allow.contains(&Target::Prefix(Ipv4Net::zero())),
+            !peers.is_empty(),
         )?;
         let poller_timeout = Duration::from_millis(100);
         let poller = Poller::new(vm.as_raw_fd(), host.as_raw_fd(), poller_timeout)?;
@@ -103,6 +125,7 @@ impl Proxy<'_> {
             host,
             poller,
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
+            peer_mac_addresses: peers.into_iter().map(|peer| peer.mac_address).collect(),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
             rules,
             enobufs_encountered: false,
@@ -209,7 +232,7 @@ mod tests {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use prefix_trie::PrefixMap;
     use serial_test::serial;
-    use smoltcp::wire::{Ipv4Address, Ipv4Packet};
+    use smoltcp::wire::{EthernetAddress, Ipv4Address, Ipv4Packet};
     use std::collections::HashSet;
     use std::os::fd::AsRawFd;
     use std::str::FromStr;
@@ -295,6 +318,7 @@ mod tests {
                 .map(|cidr| cidr.parse().unwrap())
                 .collect(),
             Vec::default(),
+            Vec::default(),
         )
         .unwrap();
 
@@ -316,6 +340,6 @@ mod tests {
 
         let ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_slice());
 
-        proxy.allowed_from_vm_ipv4(ipv4_pkt)
+        proxy.allowed_from_vm_ipv4(ipv4_pkt, EthernetAddress([0; 6]))
     }
 }

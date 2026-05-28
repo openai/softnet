@@ -10,12 +10,6 @@ impl Proxy<'_> {
             return Ok(());
         }
 
-        // Snoop bootpd(8) replies from the host to
-        // figure out the IP assigned to the VM
-        if frame.dst_addr() == self.vm_mac_address {
-            self.snoop(frame);
-        }
-
         match self.vm.write(frame.as_ref()) {
             Ok(_) => Ok(()),
             Err(err) => {
@@ -37,6 +31,51 @@ impl Proxy<'_> {
     }
 
     fn allowed_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        if self.peer_mac_addresses.is_empty() {
+            // Peers unset → isolation between VMs is enabled → all frames are from gateway
+            return self.allowed_from_gateway(frame);
+        }
+
+        // Peers set → isolation between VMs is disabled → can receive a frame from any VM
+        let from_gateway = Some(frame.src_addr()) == self.host.gateway_mac;
+        if from_gateway {
+            return self.allowed_from_gateway(frame);
+        }
+
+        let from_peer = self.peer_mac_addresses.contains(&frame.src_addr());
+        if from_peer {
+            return self.allowed_from_peer(frame);
+        }
+
+        None
+    }
+
+    fn allowed_from_gateway(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        let decision = match frame.ethertype() {
+            EthernetProtocol::Arp => Some(()),
+            EthernetProtocol::Ipv4 => Some(()),
+            _ => None,
+        };
+
+        if decision.is_some() {
+            // Snoop bootpd(8) replies from the gateway to
+            // figure out the IP assigned to the VM
+            if frame.dst_addr() == self.vm_mac_address {
+                self.snoop(frame);
+            }
+        }
+
+        decision
+    }
+
+    fn allowed_from_peer(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+        if frame.dst_addr() != self.vm_mac_address
+            && !frame.dst_addr().is_broadcast()
+            && !frame.dst_addr().is_multicast()
+        {
+            return None;
+        }
+
         match frame.ethertype() {
             EthernetProtocol::Arp => Some(()),
             EthernetProtocol::Ipv4 => Some(()),
