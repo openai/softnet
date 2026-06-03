@@ -88,9 +88,6 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ github.token }}
       GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
-      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-      SENTRY_ORG: cirrus-labs
-      SENTRY_PROJECT: persistent-workers
     steps:
       - uses: actions/checkout@v5
         with:
@@ -99,20 +96,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
       - name: Install tools
         run: |
-          brew install go getsentry/tools/sentry-cli
+          brew install go
           brew install --cask goreleaser/tap/goreleaser-pro
       - name: Release
         run: goreleaser
-      - name: Upload Sentry debug files
-        run: |
-          cd target/aarch64-apple-darwin/release/
-          dsymutil softnet
-          sentry-cli debug-files upload -o "$SENTRY_ORG" -p "$SENTRY_PROJECT" softnet.dSYM/
-          sentry-cli debug-files bundle-sources softnet.dSYM/
-          sentry-cli debug-files upload -o "$SENTRY_ORG" -p "$SENTRY_PROJECT" softnet.src.zip
-      - name: Create Sentry release
-        run: |
-          SENTRY_RELEASE="softnet@${GITHUB_REF_NAME}"
-          sentry-cli releases new "$SENTRY_RELEASE"
-          sentry-cli releases set-commits "$SENTRY_RELEASE" --auto
-          sentry-cli releases finalize "$SENTRY_RELEASE"
