@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Sequoia
+            runner: macos-15
+          - name: macOS Tahoe
+            runner: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal
+      - name: Test
+        run: cargo test
+
+  release_dry_run:
+    name: Release (Dry Run)
+    if: github.event_name != 'pull_request' && github.ref_type != 'tag'
+    needs:
+      - lint
+      - test
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install tools
+        run: |
+          brew install go
+          brew install --cask goreleaser/tap/goreleaser-pro
+      - name: Build snapshot
+        run: goreleaser build --snapshot
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-dry-run
+          path: dist/**
+          if-no-files-found: ignore
+
+  release:
+    name: Release
+    if: github.ref_type == 'tag'
+    needs:
+      - lint
+      - test
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: cirrus-labs
+      SENTRY_PROJECT: persistent-workers
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install tools
+        run: |
+          brew install go getsentry/tools/sentry-cli
+          brew install --cask goreleaser/tap/goreleaser-pro
+      - name: Release
+        run: goreleaser
+      - name: Upload Sentry debug files
+        run: |
+          cd target/aarch64-apple-darwin/release/
+          dsymutil softnet
+          sentry-cli debug-files upload -o "$SENTRY_ORG" -p "$SENTRY_PROJECT" softnet.dSYM/
+          sentry-cli debug-files bundle-sources softnet.dSYM/
+          sentry-cli debug-files upload -o "$SENTRY_ORG" -p "$SENTRY_PROJECT" softnet.src.zip
+      - name: Create Sentry release
+        run: |
+          SENTRY_RELEASE="softnet@${GITHUB_REF_NAME}"
+          sentry-cli releases new "$SENTRY_RELEASE"
+          sentry-cli releases set-commits "$SENTRY_RELEASE" --auto
+          sentry-cli releases finalize "$SENTRY_RELEASE"
