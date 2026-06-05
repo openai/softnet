@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ github.ref_type == 'tag' && 'Release' || 'Release (Dry Run)' }}
+    runs-on: ghcr.io/cirruslabs/macos-runner:tahoe
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+      GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install release targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser-pro
+          version: "~> v2"
+          args: release --clean
+      - name: Release dry run
+        if: github.ref_type != 'tag'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser-pro
+          version: "~> v2"
+          args: release --skip=publish --snapshot --clean
+      - name: Upload dry-run artifacts
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v6
+        with:
+          name: softnet-snapshot
+          path: dist/**

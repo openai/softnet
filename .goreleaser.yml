@@ -26,7 +26,7 @@ brews:
       owner: cirruslabs
       name: homebrew-cli
     caveats: See the Github repository for more information
-    homepage: https://github.com/cirruslabs/softnet
+    homepage: https://github.com/openai/softnet
     description: Software networking with isolation for Tart
     skip_upload: auto
     custom_block: |
