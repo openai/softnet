@@ -31,7 +31,7 @@ nix = { version = "0", features = ["signal", "socket"] }
 prefix-trie = "0"
 ipnet = "2"
 oslog = "0.2.0"
-log = "0.4.29"
+log = "0.4.32"
 serial_test = "3"
 coarsetime = "0.1.37"
 
