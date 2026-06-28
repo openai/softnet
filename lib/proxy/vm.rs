@@ -1,12 +1,13 @@
+use crate::dhcp_snooper::Lease;
 use crate::proxy::udp_packet_helper::UdpPacketHelper;
 use crate::proxy::{Action, Proxy};
 use anyhow::Context;
 use anyhow::Result;
 use ipnet::Ipv4Net;
 use smoltcp::wire::{
-    ArpPacket, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, UdpPacket,
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet,
+    UdpPacket,
 };
-use std::net::Ipv4Addr;
 
 impl Proxy<'_> {
     pub(crate) fn process_frame_from_vm(&mut self, frame: EthernetFrame<&[u8]>) -> Result<()> {
@@ -40,22 +41,7 @@ impl Proxy<'_> {
     }
 
     fn allowed_from_vm_arp(&self, arp_pkt: ArpPacket<&[u8]>) -> Option<()> {
-        if arp_pkt.source_hardware_addr() != self.vm_mac_address.0 {
-            return None;
-        }
-
-        let source_protocol_addr: [u8; 4] = arp_pkt.source_protocol_addr().try_into().unwrap();
-        let source_protocol_addr = Ipv4Addr::from(source_protocol_addr);
-
-        if let Some(lease) = self.dhcp_snooper.lease() {
-            if lease.valid_ip_source(source_protocol_addr) {
-                return Some(());
-            }
-        } else if source_protocol_addr.is_unspecified() {
-            return Some(());
-        }
-
-        None
+        vm_arp_allowed(arp_pkt, self.vm_mac_address, self.dhcp_snooper.lease())
     }
 
     pub(crate) fn allowed_from_vm_ipv4(&self, ipv4_pkt: Ipv4Packet<&[u8]>) -> Option<()> {
@@ -113,5 +99,149 @@ impl Proxy<'_> {
         }
 
         None
+    }
+}
+
+fn vm_arp_allowed(
+    arp_pkt: ArpPacket<&[u8]>,
+    vm_mac_address: smoltcp::wire::EthernetAddress,
+    lease: &Option<Lease>,
+) -> Option<()> {
+    let (operation, source_hardware_addr, source_protocol_addr) =
+        match ArpRepr::parse(&arp_pkt).ok()? {
+            ArpRepr::EthernetIpv4 {
+                operation,
+                source_hardware_addr,
+                source_protocol_addr,
+                ..
+            } => (operation, source_hardware_addr, source_protocol_addr),
+            _ => return None,
+        };
+
+    if !matches!(operation, ArpOperation::Request | ArpOperation::Reply) {
+        return None;
+    }
+
+    if source_hardware_addr != vm_mac_address {
+        return None;
+    }
+
+    if let Some(lease) = lease {
+        if lease.valid_ip_source(source_protocol_addr) {
+            return Some(());
+        }
+    } else if source_protocol_addr.is_unspecified() {
+        return Some(());
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dhcp_snooper::Lease;
+    use smoltcp::wire::{
+        ArpHardware, ArpOperation, ArpPacket, EthernetAddress, EthernetProtocol, Ipv4Address,
+    };
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[test]
+    fn test_allowed_from_vm_arp_allows_unspecified_request_without_lease() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let buf = arp_packet(vm_mac_address.0, [0, 0, 0, 0], ArpOperation::Request, 6, 4);
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &None).is_some());
+    }
+
+    #[test]
+    fn test_allowed_from_vm_arp_allows_reply_for_leased_ip() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let lease_ip = Ipv4Address::new(192, 168, 0, 2);
+        let lease = Some(Lease::new(
+            lease_ip,
+            Duration::from_secs(600),
+            HashSet::new(),
+        ));
+        let buf = arp_packet(
+            vm_mac_address.0,
+            lease_ip.octets(),
+            ArpOperation::Reply,
+            6,
+            4,
+        );
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &lease).is_some());
+    }
+
+    #[test]
+    fn test_allowed_from_vm_arp_rejects_unknown_operation() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let buf = arp_packet(
+            vm_mac_address.0,
+            [0, 0, 0, 0],
+            ArpOperation::Unknown(3),
+            6,
+            4,
+        );
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &None).is_none());
+    }
+
+    #[test]
+    fn test_allowed_from_vm_arp_rejects_non_ethernet_hardware_type() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let mut buf = arp_packet(vm_mac_address.0, [0, 0, 0, 0], ArpOperation::Request, 6, 4);
+        let mut arp_pkt = ArpPacket::new_unchecked(buf.as_mut_slice());
+        arp_pkt.set_hardware_type(ArpHardware::Unknown(2));
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &None).is_none());
+    }
+
+    #[test]
+    fn test_allowed_from_vm_arp_rejects_non_ipv4_protocol_type() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let mut buf = arp_packet(vm_mac_address.0, [0, 0, 0, 0], ArpOperation::Request, 6, 4);
+        let mut arp_pkt = ArpPacket::new_unchecked(buf.as_mut_slice());
+        arp_pkt.set_protocol_type(EthernetProtocol::Ipv6);
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &None).is_none());
+    }
+
+    #[test]
+    fn test_allowed_from_vm_arp_rejects_non_ipv4_protocol_length() {
+        let vm_mac_address = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        let buf = arp_packet(vm_mac_address.0, [0, 0, 0], ArpOperation::Request, 6, 3);
+        let arp_pkt = ArpPacket::new_checked(buf.as_slice()).unwrap();
+
+        assert!(super::vm_arp_allowed(arp_pkt, vm_mac_address, &None).is_none());
+    }
+
+    fn arp_packet(
+        source_hardware_addr: [u8; 6],
+        source_protocol_addr: impl AsRef<[u8]>,
+        operation: ArpOperation,
+        hardware_len: u8,
+        protocol_len: u8,
+    ) -> Vec<u8> {
+        let source_protocol_addr = source_protocol_addr.as_ref();
+        let payload_len = 8 + 2 * (hardware_len as usize + protocol_len as usize);
+        let mut buf = vec![0; payload_len];
+        let mut arp_pkt = ArpPacket::new_unchecked(buf.as_mut_slice());
+        arp_pkt.set_hardware_type(ArpHardware::Ethernet);
+        arp_pkt.set_protocol_type(EthernetProtocol::Ipv4);
+        arp_pkt.set_hardware_len(hardware_len);
+        arp_pkt.set_protocol_len(protocol_len);
+        arp_pkt.set_operation(operation);
+        arp_pkt.set_source_hardware_addr(&source_hardware_addr[..hardware_len as usize]);
+        arp_pkt.set_source_protocol_addr(source_protocol_addr);
+        arp_pkt.set_target_hardware_addr(&[0; 6][..hardware_len as usize]);
+        arp_pkt.set_target_protocol_addr(&vec![0; protocol_len as usize]);
+        buf
     }
 }
