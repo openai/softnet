@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   release:
-    name: ${{ github.ref_type == 'tag' && 'Release' || 'Release (Dry Run)' }}
+    name: Release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ghcr.io/cirruslabs/macos-runner:tahoe
     environment: publish
     timeout-minutes: 60
@@ -27,7 +28,6 @@ jobs:
       - name: Install release targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Create release app token for this repo
-        if: github.ref_type == 'tag'
         id: app-token
         uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
         with:
@@ -35,7 +35,6 @@ jobs:
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
       - name: Create release app token for homebrew-tools
-        if: github.ref_type == 'tag'
         id: tap-token
         uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
         with:
@@ -46,7 +45,6 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       - name: Release
-        if: github.ref_type == 'tag'
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser-pro
@@ -56,17 +54,30 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ steps.tap-token.outputs.token }}
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+
+  snapshot:
+    name: Release (Dry Run)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ghcr.io/cirruslabs/macos-runner:tahoe
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install release targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Release dry run
-        if: github.ref_type != 'tag'
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser-pro
           version: "~> v2"
           args: release --skip=publish --snapshot --clean
-        env:
-          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
       - name: Upload dry-run artifacts
-        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v6
         with:
           name: softnet-snapshot
