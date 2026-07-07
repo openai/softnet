@@ -13,7 +13,7 @@ jobs:
   release:
     name: Release
     if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ghcr.io/cirruslabs/macos-runner:tahoe
+    runs-on: macos-26
     environment: publish
     timeout-minutes: 60
     steps:
@@ -58,7 +58,7 @@ jobs:
   snapshot:
     name: Release (Dry Run)
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ghcr.io/cirruslabs/macos-runner:tahoe
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
