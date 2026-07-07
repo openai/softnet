@@ -35,4 +35,6 @@ brews:
     description: Software networking with isolation for Tart
     skip_upload: auto
     custom_block: |
-      depends_on :macos => :sequoia
+      on_macos do
+        depends_on :macos => :sequoia
+      end
