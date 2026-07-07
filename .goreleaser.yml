@@ -23,10 +23,15 @@ release:
 brews:
   - name: "{{ .ProjectName }}"
     repository:
-      owner: cirruslabs
-      name: homebrew-cli
+      owner: openai
+      name: homebrew-tools
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+      branch: "softnet-{{ .Version }}"
+      pull_request:
+        enabled: true
+    directory: Formula
     caveats: See the Github repository for more information
-    homepage: https://github.com/cirruslabs/softnet
+    homepage: https://github.com/openai/softnet
     description: Software networking with isolation for Tart
     skip_upload: auto
     custom_block: |
