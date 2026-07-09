@@ -95,7 +95,11 @@ fn validate_vm_fd(vm_fd: RawFd) -> Result<()> {
         });
     }
 
-    if address.ss_family as libc::c_int != libc::AF_UNIX {
+    // macOS returns a zero-length address for unnamed UNIX-domain sockets,
+    // including socketpair descriptors. Other socket families return their
+    // address family when getsockname succeeds.
+    let is_unix_socket = address_len == 0 || address.ss_family as libc::c_int == libc::AF_UNIX;
+    if !is_unix_socket {
         bail!("VM file descriptor {vm_fd} is not a Unix socket");
     }
 
@@ -112,6 +116,7 @@ impl AsRawFd for VM {
 mod tests {
     use super::VM;
     use std::fs::File;
+    use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
@@ -155,6 +160,14 @@ mod tests {
         let error = VM::new(stream.as_raw_fd()).err().unwrap();
 
         assert!(error.to_string().contains("not a Unix datagram socket"));
+    }
+
+    #[test]
+    fn test_new_rejects_internet_datagram_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let error = VM::new(socket.as_raw_fd()).err().unwrap();
+
+        assert!(error.to_string().contains("not a Unix socket"));
     }
 
     #[test]
