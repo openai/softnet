@@ -26,6 +26,7 @@ use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 struct Args {
     #[clap(
         long,
+        value_parser = parse_vm_fd,
         help = "FD number to use for communicating with the VM's networking stack"
     )]
     vm_fd: c_int,
@@ -217,6 +218,18 @@ fn try_main() -> anyhow::Result<()> {
     proxy.run()
 }
 
+fn parse_vm_fd(value: &str) -> Result<c_int, String> {
+    let vm_fd = value
+        .parse::<c_int>()
+        .map_err(|err| format!("invalid file descriptor: {err}"))?;
+
+    if vm_fd < 0 {
+        return Err("file descriptor must be non-negative".to_string());
+    }
+
+    Ok(vm_fd)
+}
+
 fn sudo_escalation_works() -> bool {
     let exe = std::env::current_exe().unwrap();
     let args = std::env::args().skip(1);
@@ -250,5 +263,27 @@ fn set_bootpd_lease_time(lease_time: u32) {
         );
 
         SCPreferencesCommitChanges(prefs.as_concrete_TypeRef());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_rejects_negative_vm_fd_before_startup() {
+        let error = Args::try_parse_from([
+            "softnet",
+            "--vm-fd=-1",
+            "--vm-mac-address=02:00:00:00:00:01",
+        ])
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("file descriptor must be non-negative")
+        );
     }
 }
