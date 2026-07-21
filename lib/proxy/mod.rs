@@ -16,7 +16,7 @@ pub use exposed_port::ExposedPort;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
-use prefix_trie::{Prefix, PrefixMap};
+use prefix_trie::PrefixMap;
 use smoltcp::wire::EthernetFrame;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -73,7 +73,7 @@ impl Proxy<'_> {
         let vm = VM::new(vm_fd)?;
         let host = Host::new(
             vm_net_type,
-            !allow.contains(&Target::Prefix(Ipv4Net::zero())),
+            !allow.contains(&Target::Prefix(Ipv4Net::default())),
         )?;
         let poller_timeout = Duration::from_millis(100);
         let control = control_fd
