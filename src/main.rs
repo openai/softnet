@@ -31,6 +31,13 @@ struct Args {
     )]
     vm_fd: c_int,
 
+    #[clap(
+        long,
+        value_parser = parse_vm_fd,
+        help = "connected Unix stream FD for newline-delimited JSON-RPC policy control"
+    )]
+    control_fd: Option<c_int>,
+
     #[clap(long, help = "MAC address to enforce for the VM")]
     vm_mac_address: mac_address::MacAddress,
 
@@ -203,6 +210,7 @@ fn try_main() -> anyhow::Result<()> {
         args.allow,
         args.block,
         args.expose,
+        args.control_fd.map(|fd| fd as RawFd),
     )
     .context("failed to initialize proxy")?;
 
@@ -276,6 +284,23 @@ mod tests {
         let error = Args::try_parse_from([
             "softnet",
             "--vm-fd=-1",
+            "--vm-mac-address=02:00:00:00:00:01",
+        ])
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("file descriptor must be non-negative")
+        );
+    }
+
+    #[test]
+    fn test_cli_rejects_negative_control_fd_before_startup() {
+        let error = Args::try_parse_from([
+            "softnet",
+            "--vm-fd=0",
+            "--control-fd=-1",
             "--vm-mac-address=02:00:00:00:00:01",
         ])
         .unwrap_err();

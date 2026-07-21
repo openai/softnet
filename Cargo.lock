@@ -2579,6 +2579,8 @@ dependencies = [
  "privdrop",
  "sentry",
  "sentry-anyhow",
+ "serde",
+ "serde_json",
  "serial_test",
  "smoltcp",
  "system-configuration",

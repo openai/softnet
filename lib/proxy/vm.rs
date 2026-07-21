@@ -52,10 +52,10 @@ impl Proxy<'_> {
             let dst_addr = ipv4_pkt.dst_addr();
 
             // Filter traffic based on user-specified rules first
-            if !self.rules.is_empty() {
+            if !self.policy.rules.is_empty() {
                 let dst_net = Ipv4Net::from(dst_addr);
 
-                if let Some((_, action)) = self.rules.get_lpm(&dst_net) {
+                if let Some((_, action)) = self.policy.rules.get_lpm(&dst_net) {
                     return match action {
                         Action::Allow => Some(()),
                         Action::Block => None,
