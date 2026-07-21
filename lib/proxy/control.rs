@@ -208,6 +208,14 @@ impl Control {
             return Ok(true);
         }
 
+        if !self.process_input(rules)? {
+            return Ok(false);
+        }
+
+        if !self.output.is_empty() {
+            return Ok(true);
+        }
+
         if self.input_closed {
             return Ok(false);
         }
@@ -224,7 +232,13 @@ impl Control {
                 Ok(n) => {
                     bytes_read += n;
                     self.input.extend_from_slice(&buf[..n]);
-                    self.process_input(rules)?;
+                    if !self.process_input(rules)? {
+                        return Ok(false);
+                    }
+
+                    if !self.output.is_empty() {
+                        return Ok(true);
+                    }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err)
@@ -239,11 +253,7 @@ impl Control {
             }
         }
 
-        if !self.flush()? {
-            return Ok(false);
-        }
-
-        Ok(!self.input_closed || !self.output.is_empty())
+        Ok(!self.input_closed)
     }
 
     pub(super) fn shutdown(&self) -> Result<()> {
@@ -252,7 +262,7 @@ impl Control {
             .context("failed to shut down the control socket")
     }
 
-    fn process_input(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<()> {
+    fn process_input(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<bool> {
         loop {
             if self.discarding_input {
                 if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
@@ -262,7 +272,7 @@ impl Control {
                 }
 
                 self.input.clear();
-                return Ok(());
+                return Ok(true);
             }
 
             let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') else {
@@ -274,9 +284,11 @@ impl Control {
                         PARSE_ERROR,
                         "request exceeds the maximum frame size",
                     ))?;
+
+                    return self.flush();
                 }
 
-                return Ok(());
+                return Ok(true);
             };
 
             let line = self.input.drain(..=newline).collect::<Vec<_>>();
@@ -287,6 +299,15 @@ impl Control {
                     PARSE_ERROR,
                     "request exceeds the maximum frame size",
                 ))?;
+
+                if !self.flush()? {
+                    return Ok(false);
+                }
+
+                if !self.output.is_empty() {
+                    return Ok(true);
+                }
+
                 continue;
             }
 
@@ -295,6 +316,14 @@ impl Control {
 
             if let Some(update) = update {
                 *rules = self.policy.apply(update);
+            }
+
+            if !self.flush()? {
+                return Ok(false);
+            }
+
+            if !self.output.is_empty() {
+                return Ok(true);
             }
         }
     }
@@ -908,7 +937,10 @@ mod tests {
 
     #[test]
     fn oversized_frame_is_discarded_and_following_frame_is_processed() {
-        let (_client, server) = UnixStream::pair().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = PrefixMap::new();
 
@@ -922,7 +954,9 @@ mod tests {
         control.process_input(&mut rules).unwrap();
         assert!(!control.discarding_input);
 
-        let responses = std::str::from_utf8(&control.output)
+        let mut output = [0; 2048];
+        let n = client.read(&mut output).unwrap();
+        let responses = std::str::from_utf8(&output[..n])
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -986,6 +1020,38 @@ mod tests {
 
         assert!(bounded);
         assert!(control.output.len() - control.output_offset <= 4 * MAX_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn pipelined_policy_responses_stop_before_queue_overflow() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
+        let allow = (0..MAX_TARGETS)
+            .map(|index| format!("10.{}.{}.0/24", index / 256, index % 256))
+            .collect::<Vec<_>>();
+        let mut input = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "softnet.policy.set",
+            "params": {"allow": allow, "block": []}
+        }))
+        .unwrap();
+        input.push(b'\n');
+
+        for id in 1..=100 {
+            input.extend_from_slice(
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"softnet.policy.get\"}}\n")
+                    .as_bytes(),
+            );
+        }
+
+        control.input = input;
+        assert!(control.process_input(&mut rules).unwrap());
+        assert_eq!(rules.len(), MAX_TARGETS);
+        assert!(!control.input.is_empty());
+        assert!(!control.output.is_empty());
+        assert!(control.output.len() - control.output_offset <= MAX_PENDING_RESPONSE_BYTES);
     }
 
     #[test]
