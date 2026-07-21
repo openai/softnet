@@ -12,6 +12,7 @@ pub struct Poller<'poller> {
     timeout: Duration,
     vm_fd: BorrowedFd<'poller>,
     host_fd: BorrowedFd<'poller>,
+    control_fd: Option<BorrowedFd<'poller>>,
 }
 
 #[derive(IntoPrimitive)]
@@ -19,6 +20,7 @@ pub struct Poller<'poller> {
 enum EventKey {
     VM,
     Host,
+    Control,
     Interrupt,
 }
 
@@ -26,6 +28,7 @@ impl Poller<'_> {
     pub fn new<'poller>(
         vm_fd: RawFd,
         host_fd: RawFd,
+        control_fd: Option<RawFd>,
         timeout: Duration,
     ) -> Result<Poller<'poller>> {
         let poller = polling::Poller::new()?;
@@ -36,6 +39,7 @@ impl Poller<'_> {
             timeout,
             vm_fd: unsafe { BorrowedFd::borrow_raw(vm_fd) },
             host_fd: unsafe { BorrowedFd::borrow_raw(host_fd) },
+            control_fd: control_fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }),
         })
     }
 
@@ -46,6 +50,14 @@ impl Poller<'_> {
                 self.vm_interest(),
                 PollMode::Edge,
             )?;
+
+            if let Some(control_fd) = self.control_fd {
+                self.poller.add_with_mode(
+                    control_fd.as_raw_fd(),
+                    polling::Event::all(EventKey::Control.into()),
+                    PollMode::Edge,
+                )?;
+            }
             self.poller.add_with_mode(
                 self.host_fd.as_raw_fd(),
                 self.host_interest(),
@@ -79,8 +91,15 @@ impl Poller<'_> {
             .events
             .iter()
             .any(|ev| ev.key == Into::<usize>::into(EventKey::Interrupt));
-
         Ok((vm_readable, host_readable, interrupt))
+    }
+
+    pub fn remove_control(&mut self) -> Result<()> {
+        if let Some(control_fd) = self.control_fd.take() {
+            self.poller.delete(control_fd)?;
+        }
+
+        Ok(())
     }
 
     fn vm_interest(&self) -> polling::Event {

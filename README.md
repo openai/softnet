@@ -43,3 +43,18 @@ For proper functioning, Softnet binary requires two things:
 ## Running
 
 Softnet is started and managed automatically by Tart if `--net-softnet` flag is provided when calling `tart run`.
+
+### Dynamic network policy
+
+Softnet can update the running VM's IPv4 egress policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
+
+The supported methods are `softnet.policy.get` and `softnet.policy.set`. A complete policy update looks like this (each request and response occupies one line):
+
+```json
+{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
+{"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
+```
+
+Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all targets are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical prefixes are preserved. Targets are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block targets, and a request frame may not exceed 1 MiB.
+
+Use `block=["0.0.0.0/0"]` with specific allow targets for a default-deny policy. Closing the control socket leaves the last accepted policy active.

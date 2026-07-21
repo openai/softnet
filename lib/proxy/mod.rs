@@ -1,3 +1,4 @@
+mod control;
 mod exposed_port;
 mod host;
 mod port_forwarder;
@@ -10,6 +11,7 @@ use crate::host::NetType;
 use crate::poller::Poller;
 use crate::vm::VM;
 use anyhow::Result;
+use control::Control;
 pub use exposed_port::ExposedPort;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
@@ -29,6 +31,7 @@ pub struct Proxy<'proxy> {
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_snooper: DhcpSnooper,
     rules: PrefixMap<Ipv4Net, Action>,
+    control: Option<Control>,
     enobufs_encountered: bool,
     port_forwarder: PortForwarder,
 }
@@ -65,6 +68,7 @@ impl Proxy<'_> {
         allow: Vec<Target>,
         block: Vec<Target>,
         exposed_ports: Vec<ExposedPort>,
+        control_fd: Option<RawFd>,
     ) -> Result<Proxy<'proxy>> {
         let vm = VM::new(vm_fd)?;
         let host = Host::new(
@@ -72,7 +76,17 @@ impl Proxy<'_> {
             !allow.contains(&Target::Prefix(Ipv4Net::zero())),
         )?;
         let poller_timeout = Duration::from_millis(100);
-        let poller = Poller::new(vm.as_raw_fd(), host.as_raw_fd(), poller_timeout)?;
+        let control = control_fd
+            .map(|control_fd| {
+                Control::new(control_fd, host.gateway_ip, allow.clone(), block.clone())
+            })
+            .transpose()?;
+        let poller = Poller::new(
+            vm.as_raw_fd(),
+            host.as_raw_fd(),
+            control.as_ref().map(AsRawFd::as_raw_fd),
+            poller_timeout,
+        )?;
 
         // Craft packet filter rules
         //
@@ -105,6 +119,7 @@ impl Proxy<'_> {
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
             rules,
+            control,
             enobufs_encountered: false,
             port_forwarder: PortForwarder::new(exposed_ports),
         })
@@ -128,6 +143,10 @@ impl Proxy<'_> {
 
             // Update coarse time for the DHCP snooper
             coarsetime::Instant::update();
+
+            // Service control on every wake (including timeouts) so a bounded read or a pending
+            // response continues making progress even when no new edge is generated.
+            self.service_control();
 
             if vm_readable {
                 self.read_from_vm(buf.as_mut_slice())?;
@@ -153,6 +172,8 @@ impl Proxy<'_> {
     }
 
     fn read_from_vm(&mut self, buf: &mut [u8]) -> Result<()> {
+        let mut packets_read = 0;
+
         loop {
             match self.vm.read(buf) {
                 Ok(n) => {
@@ -161,6 +182,12 @@ impl Proxy<'_> {
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
                         self.process_frame_from_vm(frame)?;
+                    }
+
+                    packets_read += 1;
+                    if packets_read == 128 {
+                        self.service_control();
+                        packets_read = 0;
                     }
                 }
                 Err(err) => {
@@ -186,6 +213,8 @@ impl Proxy<'_> {
                             self.process_frame_from_host(&pkt)?;
                         }
                     }
+
+                    self.service_control();
                 }
                 Err(err) => {
                     if let vmnet::Error::VmnetReadNothing = err {
@@ -195,6 +224,34 @@ impl Proxy<'_> {
                     return Err(err.into());
                 }
             }
+        }
+    }
+
+    fn service_control(&mut self) {
+        let Some(control) = self.control.as_mut() else {
+            return;
+        };
+
+        let keep_open = match control.service(&mut self.rules) {
+            Ok(keep_open) => keep_open,
+            Err(err) => {
+                log::warn!("disabling Softnet control socket: {err:#}");
+                false
+            }
+        };
+
+        if keep_open {
+            return;
+        }
+
+        if let Err(err) = self.poller.remove_control() {
+            log::warn!("failed to remove Softnet control socket from the poller: {err:#}");
+        }
+
+        if let Some(control) = self.control.take()
+            && let Err(err) = control.shutdown()
+        {
+            log::warn!("failed to shut down Softnet control socket: {err:#}");
         }
     }
 }
@@ -295,6 +352,7 @@ mod tests {
                 .map(|cidr| cidr.parse().unwrap())
                 .collect(),
             Vec::default(),
+            None,
         )
         .unwrap();
 
