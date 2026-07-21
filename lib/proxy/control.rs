@@ -243,6 +243,7 @@ pub(super) struct Control {
     output: Vec<u8>,
     output_offset: usize,
     discarding_input: bool,
+    input_closed: bool,
 }
 
 impl Control {
@@ -259,6 +260,7 @@ impl Control {
             output: Vec::new(),
             output_offset: 0,
             discarding_input: false,
+            input_closed: false,
         })
     }
 
@@ -271,12 +273,19 @@ impl Control {
             return Ok(true);
         }
 
+        if self.input_closed {
+            return Ok(false);
+        }
+
         let mut buf = [0; 8192];
         let mut bytes_read = 0;
 
         while bytes_read < MAX_SERVICE_BYTES {
             match self.stream.read(&mut buf) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    self.input_closed = true;
+                    break;
+                }
                 Ok(n) => {
                     bytes_read += n;
                     self.input.extend_from_slice(&buf[..n]);
@@ -295,7 +304,11 @@ impl Control {
             }
         }
 
-        self.flush()
+        if !self.flush()? {
+            return Ok(false);
+        }
+
+        Ok(!self.input_closed || !self.output.is_empty())
     }
 
     fn process_input(&mut self, policy: &mut Policy) -> Result<()> {
@@ -595,7 +608,7 @@ mod tests {
     use smoltcp::wire::Ipv4Address;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::str::FromStr;
@@ -955,6 +968,30 @@ mod tests {
         drop(client);
         assert!(!control.service(&mut policy).unwrap());
         assert_eq!(policy.result(), before);
+    }
+
+    #[test]
+    fn write_side_eof_flushes_the_final_policy_response() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut control = Control::new(server.as_raw_fd()).unwrap();
+        let mut policy = policy(&[], &[]);
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"final-rev\"}}\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        assert!(!control.service(&mut policy).unwrap());
+
+        let mut response = [0; 1024];
+        let n = client.read(&mut response).unwrap();
+        let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["desiredRevision"], "final-rev");
+        assert!(control.output.is_empty());
     }
 
     #[test]
