@@ -37,6 +37,13 @@ pub(super) struct Policy {
     gateway_ip: Ipv4Address,
 }
 
+struct PolicyUpdate {
+    rules: PrefixMap<Ipv4Net, Action>,
+    allow: Vec<Target>,
+    block: Vec<Target>,
+    desired_revision: String,
+}
+
 impl Policy {
     pub(super) fn new(gateway_ip: Ipv4Address, allow: Vec<Target>, block: Vec<Target>) -> Self {
         let bridge_isolation = !allow.contains(&Target::Prefix(Ipv4Net::zero()));
@@ -56,11 +63,11 @@ impl Policy {
     }
 
     fn set(
-        &mut self,
+        &self,
         allow: Vec<String>,
         block: Vec<String>,
         desired_revision: String,
-    ) -> std::result::Result<(), ErrorObjectOwned> {
+    ) -> std::result::Result<Option<PolicyUpdate>, ErrorObjectOwned> {
         if desired_revision.is_empty() || desired_revision.len() > MAX_IDENTIFIER_BYTES {
             return Err(rpc_error(
                 INVALID_PARAMS,
@@ -82,7 +89,7 @@ impl Policy {
 
         if self.desired_revision.as_deref() == Some(desired_revision.as_str()) {
             if self.allow == allow && self.block == block {
-                return Ok(());
+                return Ok(None);
             }
 
             return Err(rpc_error(
@@ -105,26 +112,62 @@ impl Policy {
             ));
         }
 
-        // Build and validate everything above before updating any active state. The packet
-        // filter observes either the old PrefixMap or the complete new one.
-        self.rules = rules;
-        self.allow = allow;
-        self.block = block;
-        self.applied_revisions.insert(desired_revision.clone());
-        self.desired_revision = Some(desired_revision);
+        Ok(Some(PolicyUpdate {
+            rules,
+            allow,
+            block,
+            desired_revision,
+        }))
+    }
 
-        Ok(())
+    fn apply(&mut self, update: PolicyUpdate) {
+        // Build and validate everything before updating any active state. The packet filter
+        // observes either the old PrefixMap or the complete new one.
+        self.rules = update.rules;
+        self.allow = update.allow;
+        self.block = update.block;
+        self.applied_revisions
+            .insert(update.desired_revision.clone());
+        self.desired_revision = Some(update.desired_revision);
     }
 
     fn result(&self) -> Value {
-        json!({
-            "allow": self.allow.iter().map(target_string).collect::<Vec<_>>(),
-            "block": self.block.iter().map(target_string).collect::<Vec<_>>(),
-            "desiredRevision": self.desired_revision,
-            "ruleCount": self.rules.len(),
-            "bridgeIsolation": self.bridge_isolation,
-        })
+        policy_result(
+            &self.allow,
+            &self.block,
+            self.desired_revision.as_deref(),
+            self.rules.len(),
+            self.bridge_isolation,
+        )
     }
+}
+
+impl PolicyUpdate {
+    fn result(&self, bridge_isolation: bool) -> Value {
+        policy_result(
+            &self.allow,
+            &self.block,
+            Some(self.desired_revision.as_str()),
+            self.rules.len(),
+            bridge_isolation,
+        )
+    }
+}
+
+fn policy_result(
+    allow: &[Target],
+    block: &[Target],
+    desired_revision: Option<&str>,
+    rule_count: usize,
+    bridge_isolation: bool,
+) -> Value {
+    json!({
+        "allow": allow.iter().map(target_string).collect::<Vec<_>>(),
+        "block": block.iter().map(target_string).collect::<Vec<_>>(),
+        "desiredRevision": desired_revision,
+        "ruleCount": rule_count,
+        "bridgeIsolation": bridge_isolation,
+    })
 }
 
 fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, ErrorObjectOwned> {
@@ -224,6 +267,10 @@ impl Control {
             return Ok(false);
         }
 
+        if !self.output.is_empty() {
+            return Ok(true);
+        }
+
         let mut buf = [0; 8192];
         let mut bytes_read = 0;
 
@@ -289,7 +336,12 @@ impl Control {
                 continue;
             }
 
-            self.enqueue(handle_request(policy, &line[..newline]))?;
+            let (response, update) = handle_request(policy, &line[..newline]);
+            self.enqueue(response)?;
+
+            if let Some(update) = update {
+                policy.apply(update);
+            }
         }
     }
 
@@ -350,11 +402,14 @@ struct SetParams {
     desired_revision: String,
 }
 
-fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
+fn handle_request(policy: &Policy, line: &[u8]) -> (Value, Option<PolicyUpdate>) {
     let value = match serde_json::from_slice::<Value>(line) {
         Ok(value) => value,
         Err(_) => {
-            return error_response(Id::Null, PARSE_ERROR, "invalid JSON-RPC frame");
+            return (
+                error_response(Id::Null, PARSE_ERROR, "invalid JSON-RPC frame"),
+                None,
+            );
         }
     };
 
@@ -368,10 +423,14 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
     let request = match serde_json::from_slice::<Request<'_>>(line) {
         Ok(request) if strict_envelope && valid_id(&request.id) => request,
         _ => {
-            return error_response(response_id, INVALID_REQUEST, "invalid JSON-RPC request");
+            return (
+                error_response(response_id, INVALID_REQUEST, "invalid JSON-RPC request"),
+                None,
+            );
         }
     };
 
+    let mut update = None;
     let result = match request.method_name() {
         "softnet.policy.get" => {
             if !request.params().parse::<Value>().is_ok_and(empty_params) {
@@ -393,14 +452,17 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
             });
 
             params.and_then(|params| {
-                policy.set(params.allow, params.block, params.desired_revision)?;
-                Ok(policy.result())
+                update = policy.set(params.allow, params.block, params.desired_revision)?;
+                Ok(update.as_ref().map_or_else(
+                    || policy.result(),
+                    |update| update.result(policy.bridge_isolation),
+                ))
             })
         }
         _ => Err(rpc_error(METHOD_NOT_FOUND, "method not found")),
     };
 
-    response(request.id(), result)
+    (response(request.id(), result), update)
 }
 
 fn response_id(value: &Value) -> Id<'_> {
@@ -523,8 +585,9 @@ fn validate_control_fd(control_fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BRIDGE_ISOLATION_CONFLICT, Control, INVALID_PARAMS, INVALID_REQUEST, MAX_REQUEST_BYTES,
-        MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR, Policy, REVISION_CONFLICT, handle_request,
+        BRIDGE_ISOLATION_CONFLICT, Control, INVALID_PARAMS, INVALID_REQUEST,
+        MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES, MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR,
+        Policy, REVISION_CONFLICT, handle_request,
     };
     use crate::proxy::{Action, Target};
     use ipnet::Ipv4Net;
@@ -547,7 +610,16 @@ mod tests {
     }
 
     fn request(policy: &mut Policy, value: Value) -> Value {
-        handle_request(policy, &serde_json::to_vec(&value).unwrap())
+        raw_request(policy, &serde_json::to_vec(&value).unwrap())
+    }
+
+    fn raw_request(policy: &mut Policy, line: &[u8]) -> Value {
+        let (response, update) = handle_request(policy, line);
+        if let Some(update) = update {
+            policy.apply(update);
+        }
+
+        response
     }
 
     #[test]
@@ -730,7 +802,7 @@ mod tests {
     fn validates_json_rpc_envelope_method_and_parameters() {
         let mut policy = policy(&[], &[]);
 
-        let parse = handle_request(&mut policy, b"not-json");
+        let parse = raw_request(&mut policy, b"not-json");
         assert_eq!(parse["error"]["code"], PARSE_ERROR);
         assert!(parse["id"].is_null());
 
@@ -826,7 +898,7 @@ mod tests {
         assert_eq!(unexpected_field["error"]["code"], INVALID_REQUEST);
         assert_eq!(unexpected_field["id"], 4);
 
-        let duplicate_field = handle_request(
+        let duplicate_field = raw_request(
             &mut policy,
             br#"{"jsonrpc":"2.0","id":6,"method":"softnet.policy.get","method":"softnet.policy.set"}"#,
         );
@@ -967,6 +1039,46 @@ mod tests {
 
         assert!(bounded);
         assert!(control.output.len() - control.output_offset <= 4 * MAX_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn response_queue_overflow_does_not_apply_a_policy_update() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut control = Control::new(server.as_raw_fd()).unwrap();
+        let mut policy = policy(&[], &[]);
+        let before = policy.result();
+
+        control.output = vec![b'x'; MAX_PENDING_RESPONSE_BYTES];
+        control.input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"overflow-rev\"}}\n".to_vec();
+
+        let error = control.process_input(&mut policy).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("control response queue exceeded")
+        );
+        assert_eq!(policy.result(), before);
+        assert!(!policy.applied_revisions.contains("overflow-rev"));
+    }
+
+    #[test]
+    fn response_backpressure_stops_consuming_policy_updates() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut control = Control::new(server.as_raw_fd()).unwrap();
+        let mut policy = policy(&[], &[]);
+        let before = policy.result();
+
+        control.output = vec![b'x'; MAX_REQUEST_BYTES];
+        assert!(control.flush().unwrap());
+        assert!(!control.output.is_empty());
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"backpressure-rev\"}}\n")
+            .unwrap();
+
+        assert!(control.service(&mut policy).unwrap());
+        assert_eq!(policy.result(), before);
+        assert!(control.input.is_empty());
     }
 
     #[test]
