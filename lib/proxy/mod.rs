@@ -221,7 +221,11 @@ impl Proxy<'_> {
             log::warn!("failed to remove Softnet control socket from the poller: {err:#}");
         }
 
-        self.control = None;
+        if let Some(control) = self.control.take()
+            && let Err(err) = control.shutdown()
+        {
+            log::warn!("failed to shut down Softnet control socket: {err:#}");
+        }
     }
 }
 

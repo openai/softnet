@@ -15,6 +15,7 @@ use smoltcp::wire::Ipv4Address;
 use std::collections::HashSet;
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::{size_of, zeroed};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
@@ -309,6 +310,12 @@ impl Control {
         }
 
         Ok(!self.input_closed || !self.output.is_empty())
+    }
+
+    pub(super) fn shutdown(&self) -> Result<()> {
+        self.stream
+            .shutdown(Shutdown::Both)
+            .context("failed to shut down the control socket")
     }
 
     fn process_input(&mut self, policy: &mut Policy) -> Result<()> {
@@ -1137,5 +1144,21 @@ mod tests {
         let control = Control::new(stream.as_raw_fd()).unwrap();
         drop(control);
         assert!(unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) != -1 });
+    }
+
+    #[test]
+    fn shutdown_signals_eof_while_the_original_descriptor_remains_open() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let control = Control::new(server.as_raw_fd()).unwrap();
+
+        control.shutdown().unwrap();
+        drop(control);
+
+        assert!(unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFD) != -1 });
+        let mut response = [0; 1];
+        assert_eq!(client.read(&mut response).unwrap(), 0);
     }
 }
