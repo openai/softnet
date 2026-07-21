@@ -12,7 +12,6 @@ use prefix_trie::PrefixMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smoltcp::wire::Ipv4Address;
-use std::collections::HashSet;
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::net::Shutdown;
@@ -25,15 +24,9 @@ const MAX_TARGETS: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_SERVICE_BYTES: usize = MAX_REQUEST_BYTES;
 
-const REVISION_CONFLICT: i32 = -32001;
-const BRIDGE_ISOLATION_CONFLICT: i32 = -32002;
-
 pub(super) struct Policy {
     allow: Vec<Target>,
     block: Vec<Target>,
-    desired_revision: Option<String>,
-    applied_revisions: HashSet<String>,
-    bridge_isolation: bool,
     gateway_ip: Ipv4Address,
 }
 
@@ -41,21 +34,16 @@ struct PolicyUpdate {
     rules: PrefixMap<Ipv4Net, Action>,
     allow: Vec<Target>,
     block: Vec<Target>,
-    desired_revision: String,
 }
 
 impl Policy {
     pub(super) fn new(gateway_ip: Ipv4Address, allow: Vec<Target>, block: Vec<Target>) -> Self {
         let allow = normalize_targets(allow);
         let block = normalize_targets(block);
-        let bridge_isolation = Self::bridge_isolation(&allow);
 
         Policy {
             allow,
             block,
-            desired_revision: None,
-            applied_revisions: HashSet::new(),
-            bridge_isolation,
             gateway_ip,
         }
     }
@@ -64,15 +52,7 @@ impl Policy {
         &self,
         allow: Vec<String>,
         block: Vec<String>,
-        desired_revision: String,
-    ) -> std::result::Result<Option<PolicyUpdate>, ErrorObjectOwned> {
-        if desired_revision.is_empty() || desired_revision.len() > MAX_IDENTIFIER_BYTES {
-            return Err(rpc_error(
-                INVALID_PARAMS,
-                format!("desiredRevision must be between 1 and {MAX_IDENTIFIER_BYTES} bytes"),
-            ));
-        }
-
+    ) -> std::result::Result<PolicyUpdate, ErrorObjectOwned> {
         if allow.len() + block.len() > MAX_TARGETS {
             return Err(rpc_error(
                 INVALID_PARAMS,
@@ -82,40 +62,13 @@ impl Policy {
 
         let allow = parse_targets(allow)?;
         let block = parse_targets(block)?;
-        let bridge_isolation = Self::bridge_isolation(&allow);
         let rules = build_rules(self.gateway_ip, &allow, &block);
 
-        if self.desired_revision.as_deref() == Some(desired_revision.as_str()) {
-            if self.allow == allow && self.block == block {
-                return Ok(None);
-            }
-
-            return Err(rpc_error(
-                REVISION_CONFLICT,
-                "desiredRevision was already applied with a different policy",
-            ));
-        }
-
-        if self.applied_revisions.contains(&desired_revision) {
-            return Err(rpc_error(
-                REVISION_CONFLICT,
-                "desiredRevision was already superseded by a newer policy",
-            ));
-        }
-
-        if bridge_isolation != self.bridge_isolation {
-            return Err(rpc_error(
-                BRIDGE_ISOLATION_CONFLICT,
-                "bridge isolation cannot be changed while Softnet is running",
-            ));
-        }
-
-        Ok(Some(PolicyUpdate {
+        Ok(PolicyUpdate {
             rules,
             allow,
             block,
-            desired_revision,
-        }))
+        })
     }
 
     fn apply(&mut self, update: PolicyUpdate) -> PrefixMap<Ipv4Net, Action> {
@@ -123,54 +76,25 @@ impl Policy {
         // observes either the old PrefixMap or the complete new one.
         self.allow = update.allow;
         self.block = update.block;
-        self.applied_revisions
-            .insert(update.desired_revision.clone());
-        self.desired_revision = Some(update.desired_revision);
         update.rules
     }
 
     fn result(&self, rule_count: usize) -> Value {
-        policy_result(
-            &self.allow,
-            &self.block,
-            self.desired_revision.as_deref(),
-            rule_count,
-            self.bridge_isolation,
-        )
-    }
-
-    pub(super) fn bridge_isolation(allow: &[Target]) -> bool {
-        !allow
-            .iter()
-            .any(|target| matches!(target, Target::Prefix(prefix) if prefix.prefix_len() == 0))
+        policy_result(&self.allow, &self.block, rule_count)
     }
 }
 
 impl PolicyUpdate {
-    fn result(&self, bridge_isolation: bool) -> Value {
-        policy_result(
-            &self.allow,
-            &self.block,
-            Some(self.desired_revision.as_str()),
-            self.rules.len(),
-            bridge_isolation,
-        )
+    fn result(&self) -> Value {
+        policy_result(&self.allow, &self.block, self.rules.len())
     }
 }
 
-fn policy_result(
-    allow: &[Target],
-    block: &[Target],
-    desired_revision: Option<&str>,
-    rule_count: usize,
-    bridge_isolation: bool,
-) -> Value {
+fn policy_result(allow: &[Target], block: &[Target], rule_count: usize) -> Value {
     json!({
         "allow": allow.iter().map(target_string).collect::<Vec<_>>(),
         "block": block.iter().map(target_string).collect::<Vec<_>>(),
-        "desiredRevision": desired_revision,
         "ruleCount": rule_count,
-        "bridgeIsolation": bridge_isolation,
     })
 }
 
@@ -429,7 +353,6 @@ impl AsRawFd for Control {
 struct SetParams {
     allow: Vec<String>,
     block: Vec<String>,
-    desired_revision: String,
 }
 
 fn handle_request(
@@ -481,16 +404,15 @@ fn handle_request(
             let params = params.parse::<SetParams>().map_err(|_| {
                 rpc_error(
                     INVALID_PARAMS,
-                    "softnet.policy.set requires allow, block, and desiredRevision",
+                    "softnet.policy.set requires allow and block",
                 )
             });
 
             params.and_then(|params| {
-                update = policy.set(params.allow, params.block, params.desired_revision)?;
-                Ok(update.as_ref().map_or_else(
-                    || policy.result(rule_count),
-                    |update| update.result(policy.bridge_isolation),
-                ))
+                let next = policy.set(params.allow, params.block)?;
+                let result = next.result();
+                update = Some(next);
+                Ok(result)
             })
         }
         _ => Err(rpc_error(METHOD_NOT_FOUND, "method not found")),
@@ -619,9 +541,8 @@ fn validate_control_fd(control_fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BRIDGE_ISOLATION_CONFLICT, Control, INVALID_PARAMS, INVALID_REQUEST,
-        MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES, MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR,
-        Policy, REVISION_CONFLICT, build_rules, handle_request,
+        Control, INVALID_PARAMS, INVALID_REQUEST, MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES,
+        MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR, Policy, build_rules, handle_request,
     };
     use crate::proxy::{Action, Target};
     use ipnet::Ipv4Net;
@@ -705,9 +626,8 @@ mod tests {
         );
         assert_eq!(response["result"]["allow"], json!(["@host"]));
         assert_eq!(response["result"]["block"], json!(["0.0.0.0/0"]));
-        assert!(response["result"]["desiredRevision"].is_null());
         assert_eq!(response["result"]["ruleCount"], 2);
-        assert_eq!(response["result"]["bridgeIsolation"], true);
+        assert_eq!(response["result"].as_object().unwrap().len(), 3);
     }
 
     #[test]
@@ -722,8 +642,7 @@ mod tests {
                 "method": "softnet.policy.set",
                 "params": {
                     "allow": ["@host", "10.0.0.0/8", "10.0.0.0/8"],
-                    "block": ["192.168.64.1/32", "10.0.0.0/8"],
-                    "desiredRevision": "vm-uid:42"
+                    "block": ["192.168.64.1/32", "10.0.0.0/8"]
                 }
             }),
         );
@@ -733,7 +652,6 @@ mod tests {
             response["result"]["block"],
             json!(["10.0.0.0/8", "192.168.64.1/32"])
         );
-        assert_eq!(response["result"]["desiredRevision"], "vm-uid:42");
         assert_eq!(response["result"]["ruleCount"], 2);
 
         assert_eq!(
@@ -749,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn same_revision_is_idempotent_after_normalization_and_conflicts_on_change() {
+    fn set_normalizes_targets() {
         let mut policy = policy(&[], &[]);
 
         let first = request(
@@ -758,7 +676,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "softnet.policy.set",
-                "params": {"allow": ["@host", "10.1.2.3/8"], "block": [], "desiredRevision": "7"}
+                "params": {"allow": ["@host", "10.1.2.3/8"], "block": []}
             }),
         );
         let retry = request(
@@ -767,69 +685,15 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "softnet.policy.set",
-                "params": {"allow": ["10.0.0.0/8", "@host", "@host"], "block": [], "desiredRevision": "7"}
+                "params": {"allow": ["10.0.0.0/8", "@host", "@host"], "block": []}
             }),
         );
         assert_eq!(first["result"], retry["result"]);
         assert_eq!(first["result"]["allow"], json!(["10.0.0.0/8", "@host"]));
-
-        let before = policy.result();
-        let conflict = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "softnet.policy.set",
-                "params": {"allow": ["192.168.0.0/16"], "block": [], "desiredRevision": "7"}
-            }),
-        );
-        assert_eq!(conflict["error"]["code"], REVISION_CONFLICT);
-        assert_eq!(policy.result(), before);
     }
 
     #[test]
-    fn superseded_revision_cannot_roll_back_the_active_policy() {
-        let mut policy = policy(&[], &[]);
-
-        let first = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "softnet.policy.set",
-                "params": {"allow": ["10.0.0.0/8"], "block": [], "desiredRevision": "vm-uid:41"}
-            }),
-        );
-        assert_eq!(first["result"]["desiredRevision"], "vm-uid:41");
-
-        let second = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "softnet.policy.set",
-                "params": {"allow": [], "block": ["0.0.0.0/0"], "desiredRevision": "vm-uid:42"}
-            }),
-        );
-        assert_eq!(second["result"]["desiredRevision"], "vm-uid:42");
-        let before = policy.result();
-
-        let stale = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "softnet.policy.set",
-                "params": {"allow": ["10.0.0.0/8"], "block": [], "desiredRevision": "vm-uid:41"}
-            }),
-        );
-
-        assert_eq!(stale["error"]["code"], REVISION_CONFLICT);
-        assert_eq!(policy.result(), before);
-    }
-
-    #[test]
-    fn invalid_targets_limits_and_bridge_isolation_changes_leave_policy_unchanged() {
+    fn invalid_targets_and_limits_leave_policy_unchanged() {
         let mut policy = policy(&["@host"], &["0.0.0.0/0"]);
         let before = policy.result();
 
@@ -839,7 +703,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "softnet.policy.set",
-                "params": {"allow": ["2001:db8::/32"], "block": [], "desiredRevision": "8"}
+                "params": {"allow": ["2001:db8::/32"], "block": []}
             }),
         );
         assert_eq!(invalid["error"]["code"], INVALID_PARAMS);
@@ -852,48 +716,11 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "softnet.policy.set",
-                "params": {"allow": targets, "block": [], "desiredRevision": "9"}
+                "params": {"allow": targets, "block": []}
             }),
         );
         assert_eq!(too_many["error"]["code"], INVALID_PARAMS);
         assert_eq!(policy.result(), before);
-
-        let isolation = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "softnet.policy.set",
-                "params": {"allow": ["0.0.0.0/0"], "block": ["0.0.0.0/0"], "desiredRevision": "10"}
-            }),
-        );
-        assert_eq!(isolation["error"]["code"], BRIDGE_ISOLATION_CONFLICT);
-        assert_eq!(policy.result(), before);
-    }
-
-    #[test]
-    fn noncanonical_default_route_disables_isolation_and_round_trips() {
-        let raw_default = Target::Prefix(Ipv4Net::from_str("10.1.2.3/0").unwrap());
-        assert!(!Policy::bridge_isolation(&[raw_default]));
-
-        let mut policy = policy(&["10.1.2.3/0"], &[]);
-        let initial = policy.result();
-        assert_eq!(initial["allow"], json!(["0.0.0.0/0"]));
-        assert_eq!(initial["bridgeIsolation"], false);
-
-        let response = request(
-            &mut policy,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "softnet.policy.set",
-                "params": {"allow": ["0.0.0.0/0"], "block": [], "desiredRevision": "vm-uid:42"}
-            }),
-        );
-
-        assert_eq!(response["result"]["allow"], json!(["0.0.0.0/0"]));
-        assert_eq!(response["result"]["bridgeIsolation"], false);
-        assert_eq!(response["result"]["desiredRevision"], "vm-uid:42");
     }
 
     #[test]
@@ -930,7 +757,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "softnet.policy.set",
-                "params": {"allow": [], "block": []}
+                "params": {"allow": []}
             }),
         );
         assert_eq!(missing["error"]["code"], INVALID_PARAMS);
@@ -941,7 +768,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "method": "softnet.policy.set",
-                "params": {"allow": ["@host"], "block": [], "desiredRevision": "12"}
+                "params": {"allow": ["@host"], "block": []}
             }),
         );
         assert_eq!(missing_id["error"]["code"], INVALID_REQUEST);
@@ -954,7 +781,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": null,
                 "method": "softnet.policy.set",
-                "params": {"allow": ["@host"], "block": [], "desiredRevision": "13"}
+                "params": {"allow": ["@host"], "block": []}
             }),
         );
         assert_eq!(null_id["error"]["code"], INVALID_REQUEST);
@@ -1009,7 +836,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 5,
                 "method": "softnet.policy.set",
-                "params": {"allow": [], "block": [], "desiredRevision": "14", "unexpected": true}
+                "params": {"allow": [], "block": [], "unexpected": true}
             }),
         );
         assert_eq!(unexpected_param["error"]["code"], INVALID_PARAMS);
@@ -1029,7 +856,7 @@ mod tests {
             .write_all(
                 concat!(
                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.get\"}\n",
-                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],\"block\":[\"0.0.0.0/0\"],\"desiredRevision\":\"11\"}}\n"
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],\"block\":[\"0.0.0.0/0\"]}}\n"
                 )
                 .as_bytes(),
             )
@@ -1046,7 +873,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["id"], 1);
         assert_eq!(lines[1]["id"], 2);
-        assert_eq!(lines[1]["result"]["desiredRevision"], "11");
+        assert_eq!(lines[1]["result"]["allow"], json!(["@host"]));
         assert_eq!(control.policy.allow, vec![Target::Host]);
 
         let before = control.policy.result(rules.len());
@@ -1065,7 +892,7 @@ mod tests {
         let mut rules = PrefixMap::new();
 
         client
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"final-rev\"}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
@@ -1075,7 +902,7 @@ mod tests {
         let n = client.read(&mut response).unwrap();
         let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
         assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["desiredRevision"], "final-rev");
+        assert_eq!(response["result"]["allow"], json!(["10.0.0.0/8"]));
         assert!(control.output.is_empty());
     }
 
@@ -1124,16 +951,14 @@ mod tests {
         assert_eq!(control.policy.result(rules.len()), before);
         assert!(control.output.is_empty());
 
-        client
-            .write_all(b"\"block\":[],\"desiredRevision\":\"14\"}}\n")
-            .unwrap();
+        client.write_all(b"\"block\":[]}}\n").unwrap();
         assert!(control.service(&mut rules).unwrap());
 
         let mut response = [0; 1024];
         let n = client.read(&mut response).unwrap();
         let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
         assert_eq!(response["id"], 1);
-        assert_eq!(response["result"]["desiredRevision"], "14");
+        assert_eq!(response["result"]["allow"], json!(["@host"]));
         assert_eq!(control.policy.allow, vec![Target::Host]);
     }
 
@@ -1171,7 +996,7 @@ mod tests {
         let before = control.policy.result(rules.len());
 
         control.output = vec![b'x'; MAX_PENDING_RESPONSE_BYTES];
-        control.input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"overflow-rev\"}}\n".to_vec();
+        control.input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n".to_vec();
 
         let error = control.process_input(&mut rules).unwrap_err();
         assert!(
@@ -1180,7 +1005,6 @@ mod tests {
                 .contains("control response queue exceeded")
         );
         assert_eq!(control.policy.result(rules.len()), before);
-        assert!(!control.policy.applied_revisions.contains("overflow-rev"));
     }
 
     #[test]
@@ -1195,7 +1019,7 @@ mod tests {
         assert!(!control.output.is_empty());
 
         client
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"backpressure-rev\"}}\n")
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n")
             .unwrap();
 
         assert!(control.service(&mut rules).unwrap());

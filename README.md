@@ -51,10 +51,10 @@ Softnet can update the running VM's IPv4 egress policy without restarting the VM
 The supported methods are `softnet.policy.get` and `softnet.policy.set`. A complete policy update looks like this (each request and response occupies one line):
 
 ```json
-{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"],"desiredRevision":"vm-uid:42"}}
-{"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"desiredRevision":"vm-uid:42","ruleCount":3,"bridgeIsolation":true}}
+{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
+{"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
 ```
 
-Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all targets are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical prefixes are preserved. Targets are normalized and deduplicated, so retrying the active revision with the same policy is idempotent; reusing it with a different policy or retrying a superseded revision returns a JSON-RPC conflict error. A policy may contain at most 4096 combined allow/block targets, and a request frame may not exceed 1 MiB.
+Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all targets are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical prefixes are preserved. Targets are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block targets, and a request frame may not exceed 1 MiB.
 
-An allow target that normalizes to `0.0.0.0/0` additionally disables vmnet bridge isolation during interface creation. Bridge isolation cannot be changed for a running VM, so policy updates that would toggle it are rejected without changing the active policy. Use `block=["0.0.0.0/0"]` with specific allow targets for a default-deny policy. Closing the control socket leaves the last accepted policy active.
+Use `block=["0.0.0.0/0"]` with specific allow targets for a default-deny policy. Closing the control socket leaves the last accepted policy active.
