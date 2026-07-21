@@ -8,7 +8,7 @@ use jsonrpsee_types::{
         METHOD_NOT_FOUND_CODE as METHOD_NOT_FOUND, PARSE_ERROR_CODE as PARSE_ERROR,
     },
 };
-use prefix_trie::{Prefix, PrefixMap};
+use prefix_trie::PrefixMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smoltcp::wire::Ipv4Address;
@@ -47,9 +47,9 @@ struct PolicyUpdate {
 
 impl Policy {
     pub(super) fn new(gateway_ip: Ipv4Address, allow: Vec<Target>, block: Vec<Target>) -> Self {
-        let bridge_isolation = !allow.contains(&Target::Prefix(Ipv4Net::zero()));
         let allow = normalize_targets(allow);
         let block = normalize_targets(block);
+        let bridge_isolation = Self::bridge_isolation(&allow);
         let rules = build_rules(gateway_ip, &allow, &block);
 
         Policy {
@@ -85,7 +85,7 @@ impl Policy {
 
         let allow = parse_targets(allow)?;
         let block = parse_targets(block)?;
-        let bridge_isolation = !allow.contains(&Target::Prefix(Ipv4Net::zero()));
+        let bridge_isolation = Self::bridge_isolation(&allow);
         let rules = build_rules(self.gateway_ip, &allow, &block);
 
         if self.desired_revision.as_deref() == Some(desired_revision.as_str()) {
@@ -140,6 +140,12 @@ impl Policy {
             self.rules.len(),
             self.bridge_isolation,
         )
+    }
+
+    pub(super) fn bridge_isolation(allow: &[Target]) -> bool {
+        !allow
+            .iter()
+            .any(|target| matches!(target, Target::Prefix(prefix) if prefix.prefix_len() == 0))
     }
 }
 
@@ -816,6 +822,31 @@ mod tests {
         );
         assert_eq!(isolation["error"]["code"], BRIDGE_ISOLATION_CONFLICT);
         assert_eq!(policy.result(), before);
+    }
+
+    #[test]
+    fn noncanonical_default_route_disables_isolation_and_round_trips() {
+        let raw_default = Target::Prefix(Ipv4Net::from_str("10.1.2.3/0").unwrap());
+        assert!(!Policy::bridge_isolation(&[raw_default]));
+
+        let mut policy = policy(&["10.1.2.3/0"], &[]);
+        let initial = policy.result();
+        assert_eq!(initial["allow"], json!(["0.0.0.0/0"]));
+        assert_eq!(initial["bridgeIsolation"], false);
+
+        let response = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "softnet.policy.set",
+                "params": {"allow": ["0.0.0.0/0"], "block": [], "desiredRevision": "vm-uid:42"}
+            }),
+        );
+
+        assert_eq!(response["result"]["allow"], json!(["0.0.0.0/0"]));
+        assert_eq!(response["result"]["bridgeIsolation"], false);
+        assert_eq!(response["result"]["desiredRevision"], "vm-uid:42");
     }
 
     #[test]
