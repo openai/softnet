@@ -76,7 +76,7 @@ impl Poller<'_> {
         self.events.clear();
     }
 
-    pub fn wait(&mut self) -> Result<(bool, bool, bool, bool)> {
+    pub fn wait(&mut self) -> Result<(bool, bool, bool)> {
         self.poller.wait(&mut self.events, Some(self.timeout))?;
 
         let vm_readable = self
@@ -91,12 +91,7 @@ impl Poller<'_> {
             .events
             .iter()
             .any(|ev| ev.key == Into::<usize>::into(EventKey::Interrupt));
-        let control_ready = self
-            .events
-            .iter()
-            .any(|ev| ev.key == Into::<usize>::into(EventKey::Control));
-
-        Ok((vm_readable, host_readable, control_ready, interrupt))
+        Ok((vm_readable, host_readable, interrupt))
     }
 
     pub fn remove_control(&mut self) -> Result<()> {

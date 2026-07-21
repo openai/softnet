@@ -139,7 +139,7 @@ impl Proxy<'_> {
         self.poller.arm()?;
 
         loop {
-            let (vm_readable, host_readable, control_ready, interrupt) = self.poller.wait()?;
+            let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
 
             // Update coarse time for the DHCP snooper
             coarsetime::Instant::update();
@@ -162,7 +162,7 @@ impl Proxy<'_> {
             }
 
             // Timeout
-            if !vm_readable && !host_readable && !control_ready && !interrupt {
+            if !vm_readable && !host_readable && !interrupt {
                 self.port_forwarder
                     .tick(&mut self.host, self.dhcp_snooper.lease());
             }
