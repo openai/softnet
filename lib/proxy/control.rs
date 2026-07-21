@@ -49,7 +49,7 @@ impl Policy {
         }
     }
 
-    fn replace(
+    fn set(
         &mut self,
         allow: Vec<String>,
         block: Vec<String>,
@@ -92,7 +92,7 @@ impl Policy {
             ));
         }
 
-        // Build and validate everything above before replacing any active state. The packet
+        // Build and validate everything above before updating any active state. The packet
         // filter observes either the old PrefixMap or the complete new one.
         self.rules = rules;
         self.allow = allow;
@@ -341,7 +341,7 @@ struct Request {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ReplaceParams {
+struct SetParams {
     allow: Vec<String>,
     block: Vec<String>,
     desired_revision: String,
@@ -377,21 +377,6 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
     let id = request.id.unwrap_or(Value::Null);
 
     let result = match request.method.as_str() {
-        "softnet.capabilities" => {
-            if !empty_params(&request.params) {
-                Err(RpcError::new(
-                    INVALID_PARAMS,
-                    "softnet.capabilities does not accept parameters",
-                ))
-            } else {
-                Ok(json!({
-                    "policyReplace": true,
-                    "bridgeIsolationMutable": false,
-                    "maxRequestBytes": MAX_REQUEST_BYTES,
-                    "maxTargets": MAX_TARGETS,
-                }))
-            }
-        }
         "softnet.policy.get" => {
             if !empty_params(&request.params) {
                 Err(RpcError::new(
@@ -402,16 +387,16 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
                 Ok(policy.result())
             }
         }
-        "softnet.policy.replace" => {
-            let params = serde_json::from_value::<ReplaceParams>(request.params).map_err(|_| {
+        "softnet.policy.set" => {
+            let params = serde_json::from_value::<SetParams>(request.params).map_err(|_| {
                 RpcError::new(
                     INVALID_PARAMS,
-                    "softnet.policy.replace requires allow, block, and desiredRevision",
+                    "softnet.policy.set requires allow, block, and desiredRevision",
                 )
             });
 
             params.and_then(|params| {
-                policy.replace(params.allow, params.block, params.desired_revision)?;
+                policy.set(params.allow, params.block, params.desired_revision)?;
                 Ok(policy.result())
             })
         }
@@ -573,17 +558,8 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_and_get_report_limits_and_initial_policy() {
+    fn get_reports_initial_policy() {
         let mut policy = policy(&["@host"], &["0.0.0.0/0"]);
-
-        let capabilities = request(
-            &mut policy,
-            json!({"jsonrpc": "2.0", "id": "capabilities", "method": "softnet.capabilities"}),
-        );
-        assert_eq!(capabilities["result"]["policyReplace"], true);
-        assert_eq!(capabilities["result"]["bridgeIsolationMutable"], false);
-        assert_eq!(capabilities["result"]["maxRequestBytes"], MAX_REQUEST_BYTES);
-        assert_eq!(capabilities["result"]["maxTargets"], MAX_TARGETS);
 
         let response = request(
             &mut policy,
@@ -597,15 +573,15 @@ mod tests {
     }
 
     #[test]
-    fn replace_applies_complete_policy_and_preserves_block_precedence() {
+    fn set_applies_complete_policy_and_preserves_block_precedence() {
         let mut policy = policy(&[], &[]);
 
         let response = request(
             &mut policy,
             json!({
                 "jsonrpc": "2.0",
-                "id": "replace",
-                "method": "softnet.policy.replace",
+                "id": "set",
+                "method": "softnet.policy.set",
                 "params": {
                     "allow": ["@host", "10.0.0.0/8", "10.0.0.0/8"],
                     "block": ["192.168.64.1/32", "10.0.0.0/8"],
@@ -643,7 +619,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["@host", "10.1.2.3/8"], "block": [], "desiredRevision": "7"}
             }),
         );
@@ -652,7 +628,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["10.0.0.0/8", "@host", "@host"], "block": [], "desiredRevision": "7"}
             }),
         );
@@ -665,7 +641,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 3,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["192.168.0.0/16"], "block": [], "desiredRevision": "7"}
             }),
         );
@@ -683,7 +659,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["2001:db8::/32"], "block": [], "desiredRevision": "8"}
             }),
         );
@@ -696,7 +672,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": targets, "block": [], "desiredRevision": "9"}
             }),
         );
@@ -708,7 +684,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 3,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["0.0.0.0/0"], "block": ["0.0.0.0/0"], "desiredRevision": "10"}
             }),
         );
@@ -749,7 +725,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": 3,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": [], "block": []}
             }),
         );
@@ -760,7 +736,7 @@ mod tests {
             &mut policy,
             json!({
                 "jsonrpc": "2.0",
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["@host"], "block": [], "desiredRevision": "12"}
             }),
         );
@@ -773,7 +749,7 @@ mod tests {
             json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "method": "softnet.policy.replace",
+                "method": "softnet.policy.set",
                 "params": {"allow": ["@host"], "block": [], "desiredRevision": "13"}
             }),
         );
@@ -795,7 +771,7 @@ mod tests {
             .write_all(
                 concat!(
                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.get\"}\n",
-                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.replace\",\"params\":{\"allow\":[\"@host\"],\"block\":[\"0.0.0.0/0\"],\"desiredRevision\":\"11\"}}\n"
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],\"block\":[\"0.0.0.0/0\"],\"desiredRevision\":\"11\"}}\n"
                 )
                 .as_bytes(),
             )
@@ -859,7 +835,7 @@ mod tests {
 
         client
             .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.replace\",\"params\":{\"allow\":[\"@host\"],",
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],",
             )
             .unwrap();
         assert!(control.service(&mut policy).unwrap());
