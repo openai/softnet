@@ -12,6 +12,7 @@ use prefix_trie::{Prefix, PrefixMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smoltcp::wire::Ipv4Address;
+use std::collections::HashSet;
 use std::io::{self, ErrorKind, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -31,6 +32,7 @@ pub(super) struct Policy {
     allow: Vec<Target>,
     block: Vec<Target>,
     desired_revision: Option<String>,
+    applied_revisions: HashSet<String>,
     bridge_isolation: bool,
     gateway_ip: Ipv4Address,
 }
@@ -47,6 +49,7 @@ impl Policy {
             allow,
             block,
             desired_revision: None,
+            applied_revisions: HashSet::new(),
             bridge_isolation,
             gateway_ip,
         }
@@ -88,6 +91,13 @@ impl Policy {
             ));
         }
 
+        if self.applied_revisions.contains(&desired_revision) {
+            return Err(rpc_error(
+                REVISION_CONFLICT,
+                "desiredRevision was already superseded by a newer policy",
+            ));
+        }
+
         if bridge_isolation != self.bridge_isolation {
             return Err(rpc_error(
                 BRIDGE_ISOLATION_CONFLICT,
@@ -100,6 +110,7 @@ impl Policy {
         self.rules = rules;
         self.allow = allow;
         self.block = block;
+        self.applied_revisions.insert(desired_revision.clone());
         self.desired_revision = Some(desired_revision);
 
         Ok(())
@@ -628,6 +639,47 @@ mod tests {
             }),
         );
         assert_eq!(conflict["error"]["code"], REVISION_CONFLICT);
+        assert_eq!(policy.result(), before);
+    }
+
+    #[test]
+    fn superseded_revision_cannot_roll_back_the_active_policy() {
+        let mut policy = policy(&[], &[]);
+
+        let first = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "softnet.policy.set",
+                "params": {"allow": ["10.0.0.0/8"], "block": [], "desiredRevision": "vm-uid:41"}
+            }),
+        );
+        assert_eq!(first["result"]["desiredRevision"], "vm-uid:41");
+
+        let second = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "softnet.policy.set",
+                "params": {"allow": [], "block": ["0.0.0.0/0"], "desiredRevision": "vm-uid:42"}
+            }),
+        );
+        assert_eq!(second["result"]["desiredRevision"], "vm-uid:42");
+        let before = policy.result();
+
+        let stale = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "softnet.policy.set",
+                "params": {"allow": ["10.0.0.0/8"], "block": [], "desiredRevision": "vm-uid:41"}
+            }),
+        );
+
+        assert_eq!(stale["error"]["code"], REVISION_CONFLICT);
         assert_eq!(policy.result(), before);
     }
 
