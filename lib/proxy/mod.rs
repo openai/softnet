@@ -16,6 +16,7 @@ pub use exposed_port::ExposedPort;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
+use prefix_trie::PrefixMap;
 use smoltcp::wire::EthernetFrame;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -29,7 +30,7 @@ pub struct Proxy<'proxy> {
     poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_snooper: DhcpSnooper,
-    policy: Policy,
+    rules: PrefixMap<Ipv4Net, Action>,
     control: Option<Control>,
     enobufs_encountered: bool,
     port_forwarder: PortForwarder,
@@ -72,8 +73,11 @@ impl Proxy<'_> {
         let vm = VM::new(vm_fd)?;
         let host = Host::new(vm_net_type, Policy::bridge_isolation(&allow))?;
         let poller_timeout = Duration::from_millis(100);
-        let policy = Policy::new(host.gateway_ip, allow, block);
-        let control = control_fd.map(Control::new).transpose()?;
+        let control = control_fd
+            .map(|control_fd| {
+                Control::new(control_fd, host.gateway_ip, allow.clone(), block.clone())
+            })
+            .transpose()?;
         let poller = Poller::new(
             vm.as_raw_fd(),
             host.as_raw_fd(),
@@ -81,13 +85,37 @@ impl Proxy<'_> {
             poller_timeout,
         )?;
 
+        // Craft packet filter rules
+        //
+        // SECURITY: blocking rules must always take precedence
+        // over allowing rules when prefixes are identical.
+        let mut rules = PrefixMap::new();
+
+        for allow_target in allow {
+            let allow_prefix = match allow_target {
+                Target::Prefix(prefix) => prefix,
+                Target::Host => host.gateway_ip.into(),
+            };
+
+            rules.insert(allow_prefix, Action::Allow);
+        }
+
+        for block_target in block {
+            let block_prefix = match block_target {
+                Target::Prefix(prefix) => prefix,
+                Target::Host => host.gateway_ip.into(),
+            };
+
+            rules.insert(block_prefix, Action::Block);
+        }
+
         Ok(Proxy {
             vm,
             host,
             poller,
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
-            policy,
+            rules,
             control,
             enobufs_encountered: false,
             port_forwarder: PortForwarder::new(exposed_ports),
@@ -201,7 +229,7 @@ impl Proxy<'_> {
             return;
         };
 
-        let keep_open = match control.service(&mut self.policy) {
+        let keep_open = match control.service(&mut self.rules) {
             Ok(keep_open) => keep_open,
             Err(err) => {
                 log::warn!("disabling Softnet control socket: {err:#}");
@@ -248,7 +276,7 @@ mod tests {
         let proxy = create_proxy(vm_ip, vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
 
         assert_eq!(
-            proxy.policy.rules,
+            proxy.rules,
             PrefixMap::<Ipv4Net, Action>::from_iter(vec![(
                 Ipv4Net::from_str("66.66.0.0/16").unwrap(),
                 Action::Block
@@ -265,7 +293,7 @@ mod tests {
         let proxy = create_proxy(vm_ip, vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
 
         assert_eq!(
-            proxy.policy.rules,
+            proxy.rules,
             PrefixMap::<Ipv4Net, Action>::from_iter(vec![
                 (Ipv4Net::from_str("33.33.33.33/32").unwrap(), Action::Allow),
                 (Ipv4Net::from_str("33.33.33.0/24").unwrap(), Action::Block),
@@ -284,7 +312,7 @@ mod tests {
         let proxy = create_proxy(vm_ip, vec!["@host"], vec!["0.0.0.0/0"]);
 
         assert_eq!(
-            proxy.policy.rules,
+            proxy.rules,
             PrefixMap::from_iter(vec![
                 (proxy.host.gateway_ip.into(), Action::Allow),
                 (Ipv4Net::from_str("0.0.0.0/0").unwrap(), Action::Block),

@@ -29,7 +29,6 @@ const REVISION_CONFLICT: i32 = -32001;
 const BRIDGE_ISOLATION_CONFLICT: i32 = -32002;
 
 pub(super) struct Policy {
-    pub(super) rules: PrefixMap<Ipv4Net, Action>,
     allow: Vec<Target>,
     block: Vec<Target>,
     desired_revision: Option<String>,
@@ -50,10 +49,8 @@ impl Policy {
         let allow = normalize_targets(allow);
         let block = normalize_targets(block);
         let bridge_isolation = Self::bridge_isolation(&allow);
-        let rules = build_rules(gateway_ip, &allow, &block);
 
         Policy {
-            rules,
             allow,
             block,
             desired_revision: None,
@@ -121,23 +118,23 @@ impl Policy {
         }))
     }
 
-    fn apply(&mut self, update: PolicyUpdate) {
+    fn apply(&mut self, update: PolicyUpdate) -> PrefixMap<Ipv4Net, Action> {
         // Build and validate everything before updating any active state. The packet filter
         // observes either the old PrefixMap or the complete new one.
-        self.rules = update.rules;
         self.allow = update.allow;
         self.block = update.block;
         self.applied_revisions
             .insert(update.desired_revision.clone());
         self.desired_revision = Some(update.desired_revision);
+        update.rules
     }
 
-    fn result(&self) -> Value {
+    fn result(&self, rule_count: usize) -> Value {
         policy_result(
             &self.allow,
             &self.block,
             self.desired_revision.as_deref(),
-            self.rules.len(),
+            rule_count,
             self.bridge_isolation,
         )
     }
@@ -245,6 +242,7 @@ fn build_rules(
 }
 
 pub(super) struct Control {
+    policy: Policy,
     stream: UnixStream,
     input: Vec<u8>,
     output: Vec<u8>,
@@ -254,7 +252,12 @@ pub(super) struct Control {
 }
 
 impl Control {
-    pub(super) fn new(control_fd: RawFd) -> Result<Self> {
+    pub(super) fn new(
+        control_fd: RawFd,
+        gateway_ip: Ipv4Address,
+        allow: Vec<Target>,
+        block: Vec<Target>,
+    ) -> Result<Self> {
         let control_fd = duplicate_control_fd(control_fd)?;
 
         // SAFETY: duplicate_control_fd returns an open Unix stream descriptor that it owns.
@@ -262,6 +265,7 @@ impl Control {
         stream.set_nonblocking(true)?;
 
         Ok(Control {
+            policy: Policy::new(gateway_ip, allow, block),
             stream,
             input: Vec::new(),
             output: Vec::new(),
@@ -271,7 +275,7 @@ impl Control {
         })
     }
 
-    pub(super) fn service(&mut self, policy: &mut Policy) -> Result<bool> {
+    pub(super) fn service(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<bool> {
         if !self.flush()? {
             return Ok(false);
         }
@@ -296,7 +300,7 @@ impl Control {
                 Ok(n) => {
                     bytes_read += n;
                     self.input.extend_from_slice(&buf[..n]);
-                    self.process_input(policy)?;
+                    self.process_input(rules)?;
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                 Err(err)
@@ -324,7 +328,7 @@ impl Control {
             .context("failed to shut down the control socket")
     }
 
-    fn process_input(&mut self, policy: &mut Policy) -> Result<()> {
+    fn process_input(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<()> {
         loop {
             if self.discarding_input {
                 if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
@@ -362,11 +366,11 @@ impl Control {
                 continue;
             }
 
-            let (response, update) = handle_request(policy, &line[..newline]);
+            let (response, update) = handle_request(&self.policy, rules.len(), &line[..newline]);
             self.enqueue(response)?;
 
             if let Some(update) = update {
-                policy.apply(update);
+                *rules = self.policy.apply(update);
             }
         }
     }
@@ -428,7 +432,11 @@ struct SetParams {
     desired_revision: String,
 }
 
-fn handle_request(policy: &Policy, line: &[u8]) -> (Value, Option<PolicyUpdate>) {
+fn handle_request(
+    policy: &Policy,
+    rule_count: usize,
+    line: &[u8],
+) -> (Value, Option<PolicyUpdate>) {
     let value = match serde_json::from_slice::<Value>(line) {
         Ok(value) => value,
         Err(_) => {
@@ -465,7 +473,7 @@ fn handle_request(policy: &Policy, line: &[u8]) -> (Value, Option<PolicyUpdate>)
                     "softnet.policy.get does not accept parameters",
                 ))
             } else {
-                Ok(policy.result())
+                Ok(policy.result(rule_count))
             }
         }
         "softnet.policy.set" => {
@@ -480,7 +488,7 @@ fn handle_request(policy: &Policy, line: &[u8]) -> (Value, Option<PolicyUpdate>)
             params.and_then(|params| {
                 update = policy.set(params.allow, params.block, params.desired_revision)?;
                 Ok(update.as_ref().map_or_else(
-                    || policy.result(),
+                    || policy.result(rule_count),
                     |update| update.result(policy.bridge_isolation),
                 ))
             })
@@ -613,36 +621,75 @@ mod tests {
     use super::{
         BRIDGE_ISOLATION_CONFLICT, Control, INVALID_PARAMS, INVALID_REQUEST,
         MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES, MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR,
-        Policy, REVISION_CONFLICT, handle_request,
+        Policy, REVISION_CONFLICT, build_rules, handle_request,
     };
     use crate::proxy::{Action, Target};
     use ipnet::Ipv4Net;
+    use prefix_trie::PrefixMap;
     use serde_json::{Value, json};
     use smoltcp::wire::Ipv4Address;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::str::FromStr;
     use std::time::Duration;
 
-    fn policy(allow: &[&str], block: &[&str]) -> Policy {
-        Policy::new(
+    struct TestPolicy {
+        state: Policy,
+        rules: PrefixMap<Ipv4Net, Action>,
+    }
+
+    impl TestPolicy {
+        fn result(&self) -> Value {
+            self.state.result(self.rules.len())
+        }
+    }
+
+    impl std::ops::Deref for TestPolicy {
+        type Target = Policy;
+
+        fn deref(&self) -> &Self::Target {
+            &self.state
+        }
+    }
+
+    fn targets(targets: &[&str]) -> Vec<Target> {
+        targets
+            .iter()
+            .map(|target| target.parse().unwrap())
+            .collect()
+    }
+
+    fn policy(allow: &[&str], block: &[&str]) -> TestPolicy {
+        let gateway_ip = Ipv4Address::new(192, 168, 64, 1);
+        let allow = targets(allow);
+        let block = targets(block);
+
+        TestPolicy {
+            rules: build_rules(gateway_ip, &allow, &block),
+            state: Policy::new(gateway_ip, allow, block),
+        }
+    }
+
+    fn control(control_fd: RawFd) -> anyhow::Result<Control> {
+        Control::new(
+            control_fd,
             Ipv4Address::new(192, 168, 64, 1),
-            allow.iter().map(|target| target.parse().unwrap()).collect(),
-            block.iter().map(|target| target.parse().unwrap()).collect(),
+            Vec::new(),
+            Vec::new(),
         )
     }
 
-    fn request(policy: &mut Policy, value: Value) -> Value {
+    fn request(policy: &mut TestPolicy, value: Value) -> Value {
         raw_request(policy, &serde_json::to_vec(&value).unwrap())
     }
 
-    fn raw_request(policy: &mut Policy, line: &[u8]) -> Value {
-        let (response, update) = handle_request(policy, line);
+    fn raw_request(policy: &mut TestPolicy, line: &[u8]) -> Value {
+        let (response, update) = handle_request(&policy.state, policy.rules.len(), line);
         if let Some(update) = update {
-            policy.apply(update);
+            policy.rules = policy.state.apply(update);
         }
 
         response
@@ -975,8 +1022,8 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
 
         client
             .write_all(
@@ -988,7 +1035,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(control.service(&mut policy).unwrap());
+        assert!(control.service(&mut rules).unwrap());
         let mut response = [0; 2048];
         let n = client.read(&mut response).unwrap();
         let lines = std::str::from_utf8(&response[..n])
@@ -1000,12 +1047,12 @@ mod tests {
         assert_eq!(lines[0]["id"], 1);
         assert_eq!(lines[1]["id"], 2);
         assert_eq!(lines[1]["result"]["desiredRevision"], "11");
-        assert_eq!(policy.allow, vec![Target::Host]);
+        assert_eq!(control.policy.allow, vec![Target::Host]);
 
-        let before = policy.result();
+        let before = control.policy.result(rules.len());
         drop(client);
-        assert!(!control.service(&mut policy).unwrap());
-        assert_eq!(policy.result(), before);
+        assert!(!control.service(&mut rules).unwrap());
+        assert_eq!(control.policy.result(rules.len()), before);
     }
 
     #[test]
@@ -1014,15 +1061,15 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
 
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"final-rev\"}}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
-        assert!(!control.service(&mut policy).unwrap());
+        assert!(!control.service(&mut rules).unwrap());
 
         let mut response = [0; 1024];
         let n = client.read(&mut response).unwrap();
@@ -1035,17 +1082,17 @@ mod tests {
     #[test]
     fn oversized_frame_is_discarded_and_following_frame_is_processed() {
         let (_client, server) = UnixStream::pair().unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
 
         control.input = vec![b'x'; MAX_REQUEST_BYTES + 1];
-        control.process_input(&mut policy).unwrap();
+        control.process_input(&mut rules).unwrap();
         assert!(control.discarding_input);
 
         control.input.extend_from_slice(
             b"still-too-long\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.get\"}\n",
         );
-        control.process_input(&mut policy).unwrap();
+        control.process_input(&mut rules).unwrap();
         assert!(!control.discarding_input);
 
         let responses = std::str::from_utf8(&control.output)
@@ -1064,36 +1111,36 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
-        let before = policy.result();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
+        let before = control.policy.result(rules.len());
 
         client
             .write_all(
                 b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],",
             )
             .unwrap();
-        assert!(control.service(&mut policy).unwrap());
-        assert_eq!(policy.result(), before);
+        assert!(control.service(&mut rules).unwrap());
+        assert_eq!(control.policy.result(rules.len()), before);
         assert!(control.output.is_empty());
 
         client
             .write_all(b"\"block\":[],\"desiredRevision\":\"14\"}}\n")
             .unwrap();
-        assert!(control.service(&mut policy).unwrap());
+        assert!(control.service(&mut rules).unwrap());
 
         let mut response = [0; 1024];
         let n = client.read(&mut response).unwrap();
         let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["desiredRevision"], "14");
-        assert_eq!(policy.allow, vec![Target::Host]);
+        assert_eq!(control.policy.allow, vec![Target::Host]);
     }
 
     #[test]
     fn response_backpressure_keeps_the_pending_queue_bounded() {
         let (_client, server) = UnixStream::pair().unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
+        let mut control = control(server.as_raw_fd()).unwrap();
         let response = json!({"jsonrpc": "2.0", "id": 1, "result": "x".repeat(MAX_REQUEST_BYTES)});
         let mut bounded = false;
 
@@ -1119,29 +1166,29 @@ mod tests {
     #[test]
     fn response_queue_overflow_does_not_apply_a_policy_update() {
         let (_client, server) = UnixStream::pair().unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
-        let before = policy.result();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
+        let before = control.policy.result(rules.len());
 
         control.output = vec![b'x'; MAX_PENDING_RESPONSE_BYTES];
         control.input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"overflow-rev\"}}\n".to_vec();
 
-        let error = control.process_input(&mut policy).unwrap_err();
+        let error = control.process_input(&mut rules).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("control response queue exceeded")
         );
-        assert_eq!(policy.result(), before);
-        assert!(!policy.applied_revisions.contains("overflow-rev"));
+        assert_eq!(control.policy.result(rules.len()), before);
+        assert!(!control.policy.applied_revisions.contains("overflow-rev"));
     }
 
     #[test]
     fn response_backpressure_stops_consuming_policy_updates() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let mut control = Control::new(server.as_raw_fd()).unwrap();
-        let mut policy = policy(&[], &[]);
-        let before = policy.result();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = PrefixMap::new();
+        let before = control.policy.result(rules.len());
 
         control.output = vec![b'x'; MAX_REQUEST_BYTES];
         assert!(control.flush().unwrap());
@@ -1151,28 +1198,28 @@ mod tests {
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[],\"desiredRevision\":\"backpressure-rev\"}}\n")
             .unwrap();
 
-        assert!(control.service(&mut policy).unwrap());
-        assert_eq!(policy.result(), before);
+        assert!(control.service(&mut rules).unwrap());
+        assert_eq!(control.policy.result(rules.len()), before);
         assert!(control.input.is_empty());
     }
 
     #[test]
     fn validates_control_descriptor_without_taking_ownership() {
         let file = File::open("/dev/null").unwrap();
-        let error = Control::new(file.as_raw_fd()).err().unwrap();
+        let error = control(file.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("is not a socket"));
         assert!(file.metadata().is_ok());
 
         let (datagram, _) = UnixDatagram::pair().unwrap();
-        let error = Control::new(datagram.as_raw_fd()).err().unwrap();
+        let error = control(datagram.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("not a Unix stream socket"));
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let error = Control::new(listener.as_raw_fd()).err().unwrap();
+        let error = control(listener.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("not a Unix socket"));
 
         let (stream, _peer) = UnixStream::pair().unwrap();
-        let control = Control::new(stream.as_raw_fd()).unwrap();
+        let control = control(stream.as_raw_fd()).unwrap();
         drop(control);
         assert!(unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) != -1 });
     }
@@ -1183,7 +1230,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let control = Control::new(server.as_raw_fd()).unwrap();
+        let control = control(server.as_raw_fd()).unwrap();
 
         control.shutdown().unwrap();
         drop(control);
