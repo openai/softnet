@@ -1,6 +1,13 @@
 use super::{Action, Target};
 use anyhow::{Context, Result, bail};
 use ipnet::Ipv4Net;
+use jsonrpsee_types::{
+    ErrorObjectOwned, Id, Request, Response, ResponsePayload,
+    error::{
+        INVALID_PARAMS_CODE as INVALID_PARAMS, INVALID_REQUEST_CODE as INVALID_REQUEST,
+        METHOD_NOT_FOUND_CODE as METHOD_NOT_FOUND, PARSE_ERROR_CODE as PARSE_ERROR,
+    },
+};
 use prefix_trie::{Prefix, PrefixMap};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,12 +23,8 @@ const MAX_TARGETS: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_SERVICE_BYTES: usize = MAX_REQUEST_BYTES;
 
-const PARSE_ERROR: i64 = -32700;
-const INVALID_REQUEST: i64 = -32600;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
-const REVISION_CONFLICT: i64 = -32001;
-const BRIDGE_ISOLATION_CONFLICT: i64 = -32002;
+const REVISION_CONFLICT: i32 = -32001;
+const BRIDGE_ISOLATION_CONFLICT: i32 = -32002;
 
 pub(super) struct Policy {
     pub(super) rules: PrefixMap<Ipv4Net, Action>,
@@ -54,16 +57,16 @@ impl Policy {
         allow: Vec<String>,
         block: Vec<String>,
         desired_revision: String,
-    ) -> std::result::Result<(), RpcError> {
+    ) -> std::result::Result<(), ErrorObjectOwned> {
         if desired_revision.is_empty() || desired_revision.len() > MAX_IDENTIFIER_BYTES {
-            return Err(RpcError::new(
+            return Err(rpc_error(
                 INVALID_PARAMS,
                 format!("desiredRevision must be between 1 and {MAX_IDENTIFIER_BYTES} bytes"),
             ));
         }
 
         if allow.len() + block.len() > MAX_TARGETS {
-            return Err(RpcError::new(
+            return Err(rpc_error(
                 INVALID_PARAMS,
                 format!("allow and block may contain at most {MAX_TARGETS} targets combined"),
             ));
@@ -79,14 +82,14 @@ impl Policy {
                 return Ok(());
             }
 
-            return Err(RpcError::new(
+            return Err(rpc_error(
                 REVISION_CONFLICT,
                 "desiredRevision was already applied with a different policy",
             ));
         }
 
         if bridge_isolation != self.bridge_isolation {
-            return Err(RpcError::new(
+            return Err(rpc_error(
                 BRIDGE_ISOLATION_CONFLICT,
                 "bridge isolation cannot be changed while Softnet is running",
             ));
@@ -113,12 +116,12 @@ impl Policy {
     }
 }
 
-fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, RpcError> {
+fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, ErrorObjectOwned> {
     let mut parsed = Vec::with_capacity(targets.len());
 
     for target in targets {
         let parsed_target = target.parse().map_err(|_| {
-            RpcError::new(
+            rpc_error(
                 INVALID_PARAMS,
                 format!("invalid target {target:?}: expected an IPv4 CIDR or @host"),
             )
@@ -255,7 +258,7 @@ impl Control {
                     self.input.clear();
                     self.discarding_input = true;
                     self.enqueue(error_response(
-                        Value::Null,
+                        Id::Null,
                         PARSE_ERROR,
                         "request exceeds the maximum frame size",
                     ))?;
@@ -268,7 +271,7 @@ impl Control {
 
             if newline > MAX_REQUEST_BYTES {
                 self.enqueue(error_response(
-                    Value::Null,
+                    Id::Null,
                     PARSE_ERROR,
                     "request exceeds the maximum frame size",
                 ))?;
@@ -329,17 +332,6 @@ impl AsRawFd for Control {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    jsonrpc: String,
-    #[serde(default)]
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SetParams {
     allow: Vec<String>,
@@ -351,35 +343,28 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
     let value = match serde_json::from_slice::<Value>(line) {
         Ok(value) => value,
         Err(_) => {
-            return error_response(Value::Null, PARSE_ERROR, "invalid JSON-RPC frame");
+            return error_response(Id::Null, PARSE_ERROR, "invalid JSON-RPC frame");
         }
     };
 
-    let raw_id = value.get("id").cloned();
-    let id_is_valid = raw_id.as_ref().is_some_and(valid_id);
-    let response_id = raw_id.clone().unwrap_or(Value::Null);
+    let strict_envelope = value.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+    });
+    let response_id = value.get("id").map_or(Id::Null, response_id);
 
-    let request = match serde_json::from_value::<Request>(value) {
-        Ok(request) if id_is_valid && request.jsonrpc == "2.0" => request,
+    let request = match serde_json::from_slice::<Request<'_>>(line) {
+        Ok(request) if strict_envelope && valid_id(&request.id) => request,
         _ => {
-            return error_response(
-                if id_is_valid {
-                    response_id
-                } else {
-                    Value::Null
-                },
-                INVALID_REQUEST,
-                "invalid JSON-RPC request",
-            );
+            return error_response(response_id, INVALID_REQUEST, "invalid JSON-RPC request");
         }
     };
 
-    let id = request.id.unwrap_or(Value::Null);
-
-    let result = match request.method.as_str() {
+    let result = match request.method_name() {
         "softnet.policy.get" => {
-            if !empty_params(&request.params) {
-                Err(RpcError::new(
+            if !request.params().parse::<Value>().is_ok_and(empty_params) {
+                Err(rpc_error(
                     INVALID_PARAMS,
                     "softnet.policy.get does not accept parameters",
                 ))
@@ -388,8 +373,9 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
             }
         }
         "softnet.policy.set" => {
-            let params = serde_json::from_value::<SetParams>(request.params).map_err(|_| {
-                RpcError::new(
+            let params = request.params();
+            let params = params.parse::<SetParams>().map_err(|_| {
+                rpc_error(
                     INVALID_PARAMS,
                     "softnet.policy.set requires allow, block, and desiredRevision",
                 )
@@ -400,44 +386,40 @@ fn handle_request(policy: &mut Policy, line: &[u8]) -> Value {
                 Ok(policy.result())
             })
         }
-        _ => Err(RpcError::new(METHOD_NOT_FOUND, "method not found")),
+        _ => Err(rpc_error(METHOD_NOT_FOUND, "method not found")),
     };
 
-    match result {
-        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(error) => error_response(id, error.code, error.message),
-    }
+    response(request.id(), result)
 }
 
-fn valid_id(value: &Value) -> bool {
+fn response_id(value: &Value) -> Id<'_> {
     match value {
-        Value::Null => false,
-        Value::String(value) => value.len() <= MAX_IDENTIFIER_BYTES,
-        Value::Number(value) => value.is_i64() || value.is_u64(),
-        _ => false,
+        Value::String(value) if value.len() <= MAX_IDENTIFIER_BYTES => Id::Str(value.into()),
+        Value::Number(value) => value.as_u64().map_or(Id::Null, Id::Number),
+        _ => Id::Null,
     }
 }
 
-fn empty_params(value: &Value) -> bool {
+fn valid_id(id: &Id<'_>) -> bool {
+    matches!(id, Id::Number(_))
+        || matches!(id, Id::Str(value) if value.len() <= MAX_IDENTIFIER_BYTES)
+}
+
+fn empty_params(value: Value) -> bool {
     value.is_null() || value.as_object().is_some_and(|object| object.is_empty())
 }
 
-fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+fn response(id: Id<'_>, result: std::result::Result<Value, ErrorObjectOwned>) -> Value {
+    let payload = result.map_or_else(ResponsePayload::error, ResponsePayload::success);
+    serde_json::to_value(Response::new(payload, id)).expect("JSON-RPC response is serializable")
 }
 
-struct RpcError {
-    code: i64,
-    message: String,
+fn error_response(id: Id<'_>, code: i32, message: impl Into<String>) -> Value {
+    response(id, Err(rpc_error(code, message)))
 }
 
-impl RpcError {
-    fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError {
-            code,
-            message: message.into(),
-        }
-    }
+fn rpc_error(code: i32, message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(code, message, None::<()>)
 }
 
 fn duplicate_control_fd(control_fd: RawFd) -> Result<RawFd> {
@@ -755,6 +737,60 @@ mod tests {
         );
         assert_eq!(null_id["error"]["code"], INVALID_REQUEST);
         assert!(null_id["id"].is_null());
+        assert_eq!(policy.result(), before);
+
+        let negative_id = request(
+            &mut policy,
+            json!({"jsonrpc": "2.0", "id": -1, "method": "softnet.policy.get"}),
+        );
+        assert_eq!(negative_id["error"]["code"], INVALID_REQUEST);
+        assert!(negative_id["id"].is_null());
+
+        let fractional_id = request(
+            &mut policy,
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "softnet.policy.get"}),
+        );
+        assert_eq!(fractional_id["error"]["code"], INVALID_REQUEST);
+        assert!(fractional_id["id"].is_null());
+
+        let oversized_id = request(
+            &mut policy,
+            json!({"jsonrpc": "2.0", "id": "x".repeat(257), "method": "softnet.policy.get"}),
+        );
+        assert_eq!(oversized_id["error"]["code"], INVALID_REQUEST);
+        assert!(oversized_id["id"].is_null());
+
+        let maximum_id = request(
+            &mut policy,
+            json!({"jsonrpc": "2.0", "id": u64::MAX, "method": "softnet.policy.get"}),
+        );
+        assert_eq!(maximum_id["id"], u64::MAX);
+        assert!(maximum_id.get("result").is_some());
+
+        let unexpected_field = request(
+            &mut policy,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "softnet.policy.get", "unexpected": true}),
+        );
+        assert_eq!(unexpected_field["error"]["code"], INVALID_REQUEST);
+        assert_eq!(unexpected_field["id"], 4);
+
+        let duplicate_field = handle_request(
+            &mut policy,
+            br#"{"jsonrpc":"2.0","id":6,"method":"softnet.policy.get","method":"softnet.policy.set"}"#,
+        );
+        assert_eq!(duplicate_field["error"]["code"], INVALID_REQUEST);
+        assert_eq!(duplicate_field["id"], 6);
+
+        let unexpected_param = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "softnet.policy.set",
+                "params": {"allow": [], "block": [], "desiredRevision": "14", "unexpected": true}
+            }),
+        );
+        assert_eq!(unexpected_param["error"]["code"], INVALID_PARAMS);
         assert_eq!(policy.result(), before);
     }
 
