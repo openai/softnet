@@ -1,4 +1,4 @@
-use super::{Action, Target};
+use super::{Action, Rule, Target};
 use anyhow::{Context, Result, bail};
 use ipnet::Ipv4Net;
 use jsonrpsee_types::{
@@ -102,12 +102,18 @@ fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, Error
     let mut parsed = Vec::with_capacity(targets.len());
 
     for target in targets {
-        let parsed_target = target.parse().map_err(|_| {
+        let parsed_rule = target.parse::<Rule>().map_err(|_| {
             rpc_error(
                 INVALID_PARAMS,
                 format!("invalid target {target:?}: expected an IPv4 CIDR or @host"),
             )
         })?;
+        let Rule::Stateless(parsed_target) = parsed_rule else {
+            return Err(rpc_error(
+                INVALID_PARAMS,
+                "stateful rules are not supported yet",
+            ));
+        };
         parsed.push(parsed_target);
     }
 

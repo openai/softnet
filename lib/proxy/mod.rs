@@ -2,6 +2,7 @@ mod control;
 mod exposed_port;
 mod host;
 mod port_forwarder;
+mod rule;
 mod udp_packet_helper;
 mod vm;
 
@@ -17,10 +18,10 @@ use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
 use prefix_trie::PrefixMap;
+pub use rule::{Direction, Rule, Target};
 use smoltcp::wire::EthernetFrame;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::str::FromStr;
 use std::time::Duration;
 use vmnet::Batch;
 
@@ -36,25 +37,7 @@ pub struct Proxy<'proxy> {
     port_forwarder: PortForwarder,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    Prefix(Ipv4Net),
-    Host,
-}
-
-impl FromStr for Target {
-    type Err = ipnet::AddrParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if s == "@host" {
-            return Ok(Target::Host);
-        }
-
-        Ipv4Net::from_str(s).map(Target::Prefix)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
     Block,
     Allow,
@@ -65,11 +48,15 @@ impl Proxy<'_> {
         vm_fd: RawFd,
         vm_mac_address: MacAddress,
         vm_net_type: NetType,
-        allow: Vec<Target>,
-        block: Vec<Target>,
+        allow: Vec<Rule>,
+        block: Vec<Rule>,
         exposed_ports: Vec<ExposedPort>,
         control_fd: Option<RawFd>,
     ) -> Result<Proxy<'proxy>> {
+        // Stateful rules are not supported yet
+        let allow = stateless_targets(allow);
+        let block = stateless_targets(block);
+
         let vm = VM::new(vm_fd)?;
         let host = Host::new(
             vm_net_type,
@@ -256,6 +243,16 @@ impl Proxy<'_> {
     }
 }
 
+fn stateless_targets(rules: Vec<Rule>) -> Vec<Target> {
+    rules
+        .into_iter()
+        .map(|rule| match rule {
+            Rule::Stateless(target) => target,
+            Rule::Stateful { .. } => unreachable!("stateful rules were rejected before conversion"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::NetType;
@@ -345,11 +342,11 @@ mod tests {
             NetType::Nat,
             allow
                 .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
+                .map(|value| value.parse().unwrap())
                 .collect(),
             block
                 .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
+                .map(|value| value.parse().unwrap())
                 .collect(),
             Vec::default(),
             None,

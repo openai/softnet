@@ -1,0 +1,5 @@
+rule = { SOI ~ (stateful | target) ~ EOI }
+
+stateful = { direction ~ " "+ ~ target }
+direction = { "from" | "to" }
+target = @{ ANY+ }
