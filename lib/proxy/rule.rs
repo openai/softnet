@@ -20,7 +20,8 @@ pub enum Rule {
     Stateless(Target),
     Stateful {
         direction: Direction,
-        target: Target,
+        source: Option<Target>,
+        destination: Option<Target>,
     },
 }
 
@@ -32,8 +33,8 @@ pub enum Target {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    From,
-    To,
+    In,
+    Out,
 }
 
 #[derive(Debug)]
@@ -66,14 +67,27 @@ impl Rule {
             .expect("a stateful rule always has a direction")
             .as_str()
         {
-            "from" => Direction::From,
-            "to" => Direction::To,
+            "in" => Direction::In,
+            "out" => Direction::Out,
             direction => unreachable!("unexpected direction: {direction}"),
         };
+        let side = fields
+            .next()
+            .expect("a stateful rule always has a side")
+            .as_str();
         let target =
             Self::parse_target(&fields.next().expect("a stateful rule always has a target"))?;
+        let (source, destination) = match side {
+            "from" => (Some(target), None),
+            "to" => (None, Some(target)),
+            side => unreachable!("unexpected side: {side}"),
+        };
 
-        Ok(Rule::Stateful { direction, target })
+        Ok(Rule::Stateful {
+            direction,
+            source,
+            destination,
+        })
     }
 
     fn parse_target(pair: &Pair<'_, SyntaxRule>) -> Result<Target, ParseRuleError> {
@@ -139,18 +153,22 @@ mod tests {
 
     #[test]
     fn parses_stateful_directions() {
+        let private_network = Target::Prefix(Ipv4Net::from_str("10.0.0.0/8").unwrap());
+
         assert_eq!(
-            "from   @host".parse::<Rule>().unwrap(),
+            "in from   @host".parse::<Rule>().unwrap(),
             Rule::Stateful {
-                direction: Direction::From,
-                target: Target::Host,
+                direction: Direction::In,
+                source: Some(Target::Host),
+                destination: None,
             }
         );
         assert_eq!(
-            "to 10.0.0.0/8".parse::<Rule>().unwrap(),
+            "out to 10.0.0.0/8".parse::<Rule>().unwrap(),
             Rule::Stateful {
-                direction: Direction::To,
-                target: Target::Prefix(Ipv4Net::from_str("10.0.0.0/8").unwrap()),
+                direction: Direction::Out,
+                source: None,
+                destination: Some(private_network),
             }
         );
     }
@@ -159,18 +177,15 @@ mod tests {
     fn rejects_invalid_rules() {
         for input in [
             "",
-            "from",
-            "around @host",
-            "from @host tcp",
-            "from @host port 8080",
-            "from @host proto sctp",
-            "from @host proto tcp port 8080",
-            "from@host",
-            "from=@host",
-            " from @host",
-            "from @host ",
-            "from\t@host",
-            "from\n@host",
+            "from @host",
+            "in",
+            "out",
+            "in @host",
+            "out @host",
+            "infrom @host",
+            " in from @host",
+            "in from @host ",
+            "in\tfrom @host",
         ] {
             assert!(input.parse::<Rule>().is_err(), "{input:?} should fail");
         }

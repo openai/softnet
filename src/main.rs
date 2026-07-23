@@ -63,8 +63,9 @@ struct Args {
         help = "Comma-separated list of rules for allowing traffic.\n\n\
         Rule forms:\n\n\
         * TARGET: stateless rule\n\
-        * from TARGET: stateful flows initiated from TARGET (not supported yet)\n\
-        * to TARGET: stateful flows initiated toward TARGET (not supported yet)\n\n\
+        * in|out from TARGET: stateful flows initiated from TARGET (not supported yet)\n\
+        * in|out to TARGET: stateful flows initiated toward TARGET (not supported yet)\n\n\
+        Stateful rules specify the initiating packet's direction: in enters the VM; out leaves it.\n\n\
         Targets are:\n\n\
         * IPv4 CIDRs\n\
         * @host, which matches the vmnet bridge gateway IP\n\n\
@@ -74,9 +75,9 @@ struct Args {
         --block=0.0.0.0/0 is specified.\n\n\
         Examples:\n\n\
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
-        * --allow=\"from @host\" — allow stateful flows initiated from @host\n\
-        * --allow=\"to 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
-        * --allow=\"from @host,to 192.168.0.0/24\" — multiple rules may be comma-separated",
+        * --allow=\"in from @host\" — allow stateful flows initiated from @host\n\
+        * --allow=\"out to 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
+        * --allow=\"in from @host,out to 192.168.0.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
         action = clap::ArgAction::Set
@@ -89,8 +90,9 @@ struct Args {
         help = "Comma-separated list of rules for blocking traffic.\n\n\
         Rule forms:\n\n\
         * TARGET: stateless rule\n\
-        * from TARGET: stateful flows initiated from TARGET (not supported yet)\n\
-        * to TARGET: stateful flows initiated toward TARGET (not supported yet)\n\n\
+        * in|out from TARGET: stateful flows initiated from TARGET (not supported yet)\n\
+        * in|out to TARGET: stateful flows initiated toward TARGET (not supported yet)\n\n\
+        Stateful rules specify the initiating packet's direction: in enters the VM; out leaves it.\n\n\
         Targets are:\n\n\
         * IPv4 CIDRs\n\
         * @host, which matches the vmnet bridge gateway IP\n\n\
@@ -98,9 +100,9 @@ struct Args {
         allowed and blocked, blocking takes precedence.\n\n\
         Examples:\n\n\
         * --block=0.0.0.0/0 — establish a stateless default-deny policy\n\
-        * --block=\"from @host\" — block stateful flows initiated from @host\n\
-        * --block=\"to 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
-        * --block=\"from @host,to 66.66.66.0/24\" — multiple rules may be comma-separated",
+        * --block=\"in from @host\" — block stateful flows initiated from @host\n\
+        * --block=\"out to 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
+        * --block=\"in from @host,out to 66.66.66.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
         action = clap::ArgAction::Set

@@ -1,5 +1,6 @@
 rule = { SOI ~ (stateful | target) ~ EOI }
 
-stateful = { direction ~ " "+ ~ target }
-direction = { "from" | "to" }
+stateful = { direction ~ " "+ ~ side ~ " "+ ~ target }
+direction = { "in" | "out" }
+side = { "from" | "to" }
 target = @{ ANY+ }
