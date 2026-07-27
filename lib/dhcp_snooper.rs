@@ -96,7 +96,7 @@ impl Lease {
         coarsetime::Instant::recent() < self.valid_until
     }
 
-    pub fn valid_ip_source(&self, address: Ipv4Address) -> bool {
+    pub fn is_valid_for(&self, address: Ipv4Address) -> bool {
         self.address == address && self.valid()
     }
 }

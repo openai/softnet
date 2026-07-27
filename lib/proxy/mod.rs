@@ -1,7 +1,10 @@
+mod conntrack;
 mod control;
 mod exposed_port;
 mod host;
 mod port_forwarder;
+mod rule;
+mod rules;
 mod udp_packet_helper;
 mod vm;
 
@@ -11,16 +14,17 @@ use crate::host::NetType;
 use crate::poller::Poller;
 use crate::vm::VM;
 use anyhow::Result;
+use conntrack::Conntrack;
 use control::Control;
 pub use exposed_port::ExposedPort;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use port_forwarder::PortForwarder;
-use prefix_trie::PrefixMap;
+pub use rule::{Direction, Rule, Target};
+pub(crate) use rules::{Action, Rules, build_rules, has_stateful_rules, rule_count, select_rules};
 use smoltcp::wire::EthernetFrame;
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::str::FromStr;
 use std::time::Duration;
 use vmnet::Batch;
 
@@ -30,34 +34,12 @@ pub struct Proxy<'proxy> {
     poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_snooper: DhcpSnooper,
-    rules: PrefixMap<Ipv4Net, Action>,
+    rules: Rules,
+    stateful_policy: bool,
     control: Option<Control>,
+    conntrack: Conntrack,
     enobufs_encountered: bool,
     port_forwarder: PortForwarder,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    Prefix(Ipv4Net),
-    Host,
-}
-
-impl FromStr for Target {
-    type Err = ipnet::AddrParseError;
-
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        if s == "@host" {
-            return Ok(Target::Host);
-        }
-
-        Ipv4Net::from_str(s).map(Target::Prefix)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Action {
-    Block,
-    Allow,
 }
 
 impl Proxy<'_> {
@@ -65,15 +47,15 @@ impl Proxy<'_> {
         vm_fd: RawFd,
         vm_mac_address: MacAddress,
         vm_net_type: NetType,
-        allow: Vec<Target>,
-        block: Vec<Target>,
+        allow: Vec<Rule>,
+        block: Vec<Rule>,
         exposed_ports: Vec<ExposedPort>,
         control_fd: Option<RawFd>,
     ) -> Result<Proxy<'proxy>> {
         let vm = VM::new(vm_fd)?;
         let host = Host::new(
             vm_net_type,
-            !allow.contains(&Target::Prefix(Ipv4Net::default())),
+            !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
         )?;
         let poller_timeout = Duration::from_millis(100);
         let control = control_fd
@@ -88,29 +70,8 @@ impl Proxy<'_> {
             poller_timeout,
         )?;
 
-        // Craft packet filter rules
-        //
-        // SECURITY: blocking rules must always take precedence
-        // over allowing rules when prefixes are identical.
-        let mut rules = PrefixMap::new();
-
-        for allow_target in allow {
-            let allow_prefix = match allow_target {
-                Target::Prefix(prefix) => prefix,
-                Target::Host => host.gateway_ip.into(),
-            };
-
-            rules.insert(allow_prefix, Action::Allow);
-        }
-
-        for block_target in block {
-            let block_prefix = match block_target {
-                Target::Prefix(prefix) => prefix,
-                Target::Host => host.gateway_ip.into(),
-            };
-
-            rules.insert(block_prefix, Action::Block);
-        }
+        let rules = build_rules(host.gateway_ip, &allow, &block);
+        let stateful_policy = has_stateful_rules(&rules);
 
         Ok(Proxy {
             vm,
@@ -119,7 +80,9 @@ impl Proxy<'_> {
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
             dhcp_snooper: DhcpSnooper::new(poller_timeout),
             rules,
+            stateful_policy,
             control,
+            conntrack: Conntrack::new(),
             enobufs_encountered: false,
             port_forwarder: PortForwarder::new(exposed_ports),
         })
@@ -141,8 +104,11 @@ impl Proxy<'_> {
         loop {
             let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
 
-            // Update coarse time for the DHCP snooper
+            // Update coarse time for DHCP snooping and conntrack
             coarsetime::Instant::update();
+
+            // Expire stale flows before processing packets
+            self.conntrack.tick();
 
             // Service control on every wake (including timeouts) so a bounded read or a pending
             // response continues making progress even when no new edge is generated.
@@ -177,7 +143,7 @@ impl Proxy<'_> {
         loop {
             match self.vm.read(buf) {
                 Ok(n) => {
-                    // Update coarse time for the DHCP snooper
+                    // Update coarse time for DHCP snooping and conntrack
                     coarsetime::Instant::update();
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
@@ -205,7 +171,7 @@ impl Proxy<'_> {
         loop {
             match self.host.read(batch, bufs) {
                 Ok(pktcnt) => {
-                    // Update coarse time for the DHCP snooper
+                    // Update coarse time for DHCP snooping and conntrack
                     coarsetime::Instant::update();
 
                     for buf in batch.packet_sized_bufs(bufs).take(pktcnt) {
@@ -240,6 +206,11 @@ impl Proxy<'_> {
             }
         };
 
+        if control.policy_changed() {
+            self.stateful_policy = has_stateful_rules(&self.rules);
+            self.conntrack.clear();
+        }
+
         if keep_open {
             return;
         }
@@ -260,7 +231,7 @@ impl Proxy<'_> {
 mod tests {
     use crate::NetType;
     use crate::dhcp_snooper::Lease;
-    use crate::proxy::{Action, Proxy};
+    use crate::proxy::{Action, Proxy, Rule, Target};
     use ipnet::Ipv4Net;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -276,57 +247,73 @@ mod tests {
     #[serial]
     fn test_blocking_takes_precedence() {
         let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let proxy = create_proxy(vm_ip, vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
+        let mut proxy = create_proxy(vm_ip, vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
 
         assert_eq!(
             proxy.rules,
-            PrefixMap::<Ipv4Net, Action>::from_iter(vec![(
+            PrefixMap::<Ipv4Net, Vec<(Action, Rule)>>::from_iter(vec![(
                 Ipv4Net::from_str("66.66.0.0/16").unwrap(),
-                Action::Block
+                vec![(Action::Block, "66.66.0.0/16".parse().unwrap(),)]
             ),])
         );
 
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, "66.66.66.66").is_none());
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66").is_none());
     }
 
     #[test]
     #[serial]
     fn test_longest_prefix_match_wins() {
         let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let proxy = create_proxy(vm_ip, vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
+        let mut proxy = create_proxy(vm_ip, vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
 
         assert_eq!(
             proxy.rules,
-            PrefixMap::<Ipv4Net, Action>::from_iter(vec![
-                (Ipv4Net::from_str("33.33.33.33/32").unwrap(), Action::Allow),
-                (Ipv4Net::from_str("33.33.33.0/24").unwrap(), Action::Block),
+            PrefixMap::<Ipv4Net, Vec<(Action, Rule)>>::from_iter(vec![
+                (
+                    Ipv4Net::from_str("33.33.33.33/32").unwrap(),
+                    vec![(Action::Allow, "33.33.33.33/32".parse().unwrap(),)]
+                ),
+                (
+                    Ipv4Net::from_str("33.33.33.0/24").unwrap(),
+                    vec![(Action::Block, "33.33.33.0/24".parse().unwrap(),)]
+                ),
             ])
         );
 
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, "33.33.33.32").is_none());
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, "33.33.33.33").is_some());
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, "33.33.33.34").is_none());
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.32").is_none());
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.33").is_some());
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34").is_none());
     }
 
     #[test]
     #[serial]
     fn test_allow_host() {
         let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let proxy = create_proxy(vm_ip, vec!["@host"], vec!["0.0.0.0/0"]);
+        let mut proxy = create_proxy(vm_ip, vec!["@host"], vec!["0.0.0.0/0"]);
 
         assert_eq!(
             proxy.rules,
             PrefixMap::from_iter(vec![
-                (proxy.host.gateway_ip.into(), Action::Allow),
-                (Ipv4Net::from_str("0.0.0.0/0").unwrap(), Action::Block),
+                (
+                    proxy.host.gateway_ip.into(),
+                    vec![(
+                        Action::Allow,
+                        Rule::Stateless(Target::Prefix(proxy.host.gateway_ip.into())),
+                    )],
+                ),
+                (
+                    Ipv4Net::from_str("0.0.0.0/0").unwrap(),
+                    vec![(Action::Block, "0.0.0.0/0".parse().unwrap(),)]
+                ),
             ])
         );
 
         // Access to global IPs should be disallowed because of --block=0.0.0.0/0
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, "8.8.8.8").is_none());
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "8.8.8.8").is_none());
 
         // Despite the above, access to host IP address should be possible because of --allow=@host
-        assert!(allowed_from_vm_ipv4(&proxy, vm_ip, &proxy.host.gateway_ip.to_string()).is_some());
+        let gateway_ip = proxy.host.gateway_ip.to_string();
+        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip).is_some());
     }
 
     fn create_proxy<'test>(vm_ip: Ipv4Address, allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {
@@ -345,11 +332,11 @@ mod tests {
             NetType::Nat,
             allow
                 .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
+                .map(|value| value.parse().unwrap())
                 .collect(),
             block
                 .into_iter()
-                .map(|cidr| cidr.parse().unwrap())
+                .map(|value| value.parse().unwrap())
                 .collect(),
             Vec::default(),
             None,
@@ -365,7 +352,7 @@ mod tests {
         proxy
     }
 
-    fn allowed_from_vm_ipv4(proxy: &Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
+    fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
         let mut buf = vec![0; 1500];
 
         let mut ipv4_pkt_mut = Ipv4Packet::new_unchecked(&mut buf[..]);

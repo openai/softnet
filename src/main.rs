@@ -7,7 +7,7 @@ use privdrop::PrivDrop;
 use softnet::NetType;
 use softnet::proxy::ExposedPort;
 use softnet::proxy::Proxy;
-use softnet::proxy::Target;
+use softnet::proxy::Rule;
 use std::borrow::Cow;
 use std::env;
 use std::os::raw::c_int;
@@ -59,34 +59,51 @@ struct Args {
 
     #[clap(
         long,
-        help = "Comma-separated list of CIDRs to allow the traffic to \
-        (e.g. --allow=192.168.0.0/24 may be used to allow a LAN access for a VM), \
-        plus supported @-aliases. Currently the only supported @-alias is @host, \
-        which matches the vmnet bridge gateway IP. \
-        When used with --block, the longest prefix match always wins. \
-        In case an identical prefix is both --allow'ed and --block'ed, \
-        blocking will take precedence. --allow=0.0.0.0/0 is a special case, \
-        it additionally disables bridge isolation (even when --block=0.0.0.0/0 is specified).",
-        value_name = "comma-separated CIDRs or @-alias",
+        help = "Comma-separated list of rules for allowing traffic.\n\n\
+        Rule forms:\n\n\
+        * TARGET: traffic between TARGET and the VM in either direction\n\
+        * in TARGET: flows initiated from TARGET to the VM\n\
+        * out TARGET: flows initiated from the VM to TARGET\n\n\
+        Targets are:\n\n\
+        * IPv4 CIDRs\n\
+        * @host, which matches the vmnet bridge gateway IP\n\n\
+        When used with --block, the longest prefix match wins. If an identical rule is both \
+        allowed and blocked, blocking takes precedence.\n\n\
+        --allow=0.0.0.0/0 additionally disables bridge isolation, even when \
+        --block=0.0.0.0/0 is specified.\n\n\
+        Examples:\n\n\
+        * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
+        * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
+        * --allow=\"out 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
+        * --allow=\"in @host,out 192.168.0.0/24\" — multiple rules may be comma-separated",
+        value_name = "comma-separated rules",
         use_value_delimiter = true,
         action = clap::ArgAction::Set
     )]
-    allow: Vec<Target>,
+    allow: Vec<Rule>,
 
     #[clap(
         long,
-        help = "Comma-separated list of CIDRs to block the traffic to \
-        (e.g. --block=0.0.0.0/0 may be used to establish a default deny policy \
-        that is further relaxed with --allow), plus supported @-aliases. \
-        Currently the only supported @-alias is @host, which matches the vmnet bridge gateway IP. \
-        When used with --allow, the longest prefix match always wins. \
-        In case an identical prefix is both --allow'ed and --block'ed, \
-        blocking will take precedence.",
-        value_name = "comma-separated CIDRs or @-alias",
+        help = "Comma-separated list of rules for blocking traffic.\n\n\
+        Rule forms:\n\n\
+        * TARGET: traffic between TARGET and the VM in either direction\n\
+        * in TARGET: flows initiated from TARGET to the VM\n\
+        * out TARGET: flows initiated from the VM to TARGET\n\n\
+        Targets are:\n\n\
+        * IPv4 CIDRs\n\
+        * @host, which matches the vmnet bridge gateway IP\n\n\
+        When used with --allow, the longest prefix match wins. If an identical rule is both \
+        allowed and blocked, blocking takes precedence.\n\n\
+        Examples:\n\n\
+        * --block=0.0.0.0/0 — establish a stateless default-deny policy\n\
+        * --block=\"in @host\" — block stateful flows initiated from @host\n\
+        * --block=\"out 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
+        * --block=\"in @host,out 66.66.66.0/24\" — multiple rules may be comma-separated",
+        value_name = "comma-separated rules",
         use_value_delimiter = true,
         action = clap::ArgAction::Set
     )]
-    block: Vec<Target>,
+    block: Vec<Rule>,
 
     #[clap(
         long,

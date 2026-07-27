@@ -46,7 +46,7 @@ Softnet is started and managed automatically by Tart if `--net-softnet` flag is 
 
 ### Dynamic network policy
 
-Softnet can update the running VM's IPv4 egress policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
+Softnet can update the running VM's IPv4 policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
 
 The supported methods are `softnet.policy.get` and `softnet.policy.set`. A complete policy update looks like this (each request and response occupies one line):
 
@@ -55,6 +55,8 @@ The supported methods are `softnet.policy.get` and `softnet.policy.set`. A compl
 {"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
 ```
 
-Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all targets are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical prefixes are preserved. Targets are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block targets, and a request frame may not exceed 1 MiB.
+Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all rules are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical rules are preserved. Rules are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block rules, and a request frame may not exceed 1 MiB.
 
-Use `block=["0.0.0.0/0"]` with specific allow targets for a default-deny policy. Closing the control socket leaves the last accepted policy active.
+When the effective normalized policy changes, Softnet clears existing conntrack state so the new policy applies to established flows immediately. This may interrupt active connections. Repeating an equivalent normalized policy is a no-op and preserves conntrack state.
+
+Use `block=["0.0.0.0/0"]` with specific allow rules for a default-deny policy. Closing the control socket leaves the last accepted policy active.
