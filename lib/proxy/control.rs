@@ -117,10 +117,7 @@ fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, Error
 fn normalize_targets(targets: Vec<Target>) -> Vec<Target> {
     let mut targets = targets
         .into_iter()
-        .map(|target| match target {
-            Target::Prefix(prefix) => Target::Prefix(prefix.trunc()),
-            Target::Host => Target::Host,
-        })
+        .map(Target::normalize)
         .collect::<Vec<_>>();
 
     targets.sort_by_key(target_string);

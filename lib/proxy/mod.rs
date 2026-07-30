@@ -42,6 +42,15 @@ pub enum Target {
     Host,
 }
 
+impl Target {
+    fn normalize(self) -> Self {
+        match self {
+            Target::Prefix(prefix) => Target::Prefix(prefix.trunc()),
+            Target::Host => Target::Host,
+        }
+    }
+}
+
 impl FromStr for Target {
     type Err = ipnet::AddrParseError;
 
@@ -71,6 +80,8 @@ impl Proxy<'_> {
         control_fd: Option<RawFd>,
     ) -> Result<Proxy<'proxy>> {
         let vm = VM::new(vm_fd)?;
+        let allow = allow.into_iter().map(Target::normalize).collect::<Vec<_>>();
+        let block = block.into_iter().map(Target::normalize).collect::<Vec<_>>();
         let host = Host::new(
             vm_net_type,
             !allow.contains(&Target::Prefix(Ipv4Net::default())),
@@ -260,7 +271,7 @@ impl Proxy<'_> {
 mod tests {
     use crate::NetType;
     use crate::dhcp_snooper::Lease;
-    use crate::proxy::{Action, Proxy};
+    use crate::proxy::{Action, Proxy, Target};
     use ipnet::Ipv4Net;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
@@ -271,6 +282,14 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::str::FromStr;
     use std::time::Duration;
+
+    #[test]
+    fn test_target_normalization_canonicalizes_default_route() {
+        assert_eq!(
+            Target::Prefix(Ipv4Net::from_str("192.0.2.1/0").unwrap()).normalize(),
+            Target::Prefix(Ipv4Net::default())
+        );
+    }
 
     #[test]
     #[serial]
