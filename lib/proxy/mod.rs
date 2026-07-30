@@ -117,7 +117,7 @@ impl Proxy<'_> {
             host,
             poller,
             vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
-            dhcp_snooper: DhcpSnooper::new(poller_timeout),
+            dhcp_snooper: DhcpSnooper::new(poller_timeout, vm_mac_address.bytes()),
             rules,
             control,
             enobufs_encountered: false,
