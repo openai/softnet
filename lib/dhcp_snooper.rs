@@ -1,18 +1,20 @@
 use dhcproto::Decodable;
-use dhcproto::v4::{DhcpOption, MessageType, OptionCode};
+use dhcproto::v4::{DhcpOption, HType, MessageType, Opcode, OptionCode};
 use smoltcp::wire::Ipv4Address;
 use std::collections::HashSet;
 use std::time::Duration;
 
 #[derive(Default)]
 pub struct DhcpSnooper {
+    vm_mac_address: [u8; 6],
     vm_lease: Option<Lease>,
     uncertainty_duration: Duration,
 }
 
 impl DhcpSnooper {
-    pub fn new(uncertainty_duration: Duration) -> Self {
+    pub fn new(uncertainty_duration: Duration, vm_mac_address: [u8; 6]) -> Self {
         DhcpSnooper {
+            vm_mac_address,
             uncertainty_duration,
             ..Default::default()
         }
@@ -25,6 +27,18 @@ impl DhcpSnooper {
             Ok(message) => message,
             Err(_) => return,
         };
+
+        // DHCP replies may be broadcast[1], so validate the BOOTP client
+        // hardware address to avoid acting on another VM's lease transition
+        //
+        // [1]: https://datatracker.ietf.org/doc/html/rfc2131#section-4.1
+        if message.opcode() != Opcode::BootReply
+            || message.htype() != HType::Eth
+            || message.hlen() != self.vm_mac_address.len() as u8
+            || message.chaddr() != self.vm_mac_address
+        {
+            return;
+        }
 
         match message.opts().msg_type() {
             Some(MessageType::Ack) => {
@@ -98,5 +112,59 @@ impl Lease {
 
     pub fn valid_ip_source(&self, address: Ipv4Address) -> bool {
         self.address == address && self.valid()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DhcpSnooper, Lease};
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
+    use smoltcp::wire::Ipv4Address;
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    const VM_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const OTHER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const OLD_ADDRESS: Ipv4Address = Ipv4Address::new(192, 168, 64, 2);
+
+    #[test]
+    fn processes_replies_only_for_matching_client() {
+        // Start with an active lease
+        let mut snooper = DhcpSnooper::new(Duration::ZERO, VM_MAC);
+        snooper.set_lease(Some(Lease::new(
+            OLD_ADDRESS,
+            Duration::from_secs(600),
+            HashSet::new(),
+        )));
+
+        // Ignore a NAK for another client
+        let mut message = Message::new(
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            &OTHER_MAC,
+        );
+        message.set_opcode(Opcode::BootReply);
+        message
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Nak));
+
+        let mut encoded = Vec::new();
+        message.encode(&mut Encoder::new(&mut encoded)).unwrap();
+
+        snooper.register_dhcp_reply(&encoded);
+
+        assert_eq!(snooper.lease().as_ref().unwrap().address(), OLD_ADDRESS);
+
+        // Process a NAK for the matching client
+        message.set_chaddr(&VM_MAC);
+        encoded.clear();
+        message.encode(&mut Encoder::new(&mut encoded)).unwrap();
+
+        snooper.register_dhcp_reply(&encoded);
+
+        assert!(snooper.lease().is_none());
     }
 }
