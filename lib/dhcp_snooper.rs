@@ -28,7 +28,7 @@ impl DhcpSnooper {
             Err(_) => return,
         };
 
-        // DHCP replies may be broadcast[1], so validate the BOOTP client
+        // Decoded DHCP replies may be broadcast[1], so additionally validate the BOOTP client
         // hardware address to avoid acting on another VM's lease transition
         //
         // [1]: https://datatracker.ietf.org/doc/html/rfc2131#section-4.1
@@ -77,6 +77,11 @@ impl DhcpSnooper {
         &self.vm_lease
     }
 
+    pub(crate) fn address_and_dns_ips(&self) -> Option<(Ipv4Address, HashSet<Ipv4Address>)> {
+        let lease = self.vm_lease.as_ref().filter(|lease| lease.valid())?;
+        Some((lease.address(), lease.dns_ips.clone()))
+    }
+
     pub fn valid_dns_target(&self, addr: &Ipv4Address) -> bool {
         if let Some(lease) = &self.vm_lease {
             return lease.dns_ips.contains(addr);
@@ -110,7 +115,7 @@ impl Lease {
         coarsetime::Instant::recent() < self.valid_until
     }
 
-    pub fn valid_ip_source(&self, address: Ipv4Address) -> bool {
+    pub fn is_valid_for(&self, address: Ipv4Address) -> bool {
         self.address == address && self.valid()
     }
 }

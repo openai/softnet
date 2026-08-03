@@ -1,6 +1,5 @@
-use super::{Action, Target};
+use super::{Rule, Rules};
 use anyhow::{Context, Result, bail};
-use ipnet::Ipv4Net;
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request, Response, ResponsePayload,
     error::{
@@ -8,7 +7,6 @@ use jsonrpsee_types::{
         METHOD_NOT_FOUND_CODE as METHOD_NOT_FOUND, PARSE_ERROR_CODE as PARSE_ERROR,
     },
 };
-use prefix_trie::PrefixMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smoltcp::wire::Ipv4Address;
@@ -20,26 +18,26 @@ use std::os::unix::net::UnixStream;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_RESPONSE_BYTES: usize = 4 * MAX_REQUEST_BYTES;
-const MAX_TARGETS: usize = 4096;
+const MAX_RULES: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_SERVICE_BYTES: usize = MAX_REQUEST_BYTES;
 
 pub(super) struct Policy {
-    allow: Vec<Target>,
-    block: Vec<Target>,
+    allow: Vec<Rule>,
+    block: Vec<Rule>,
     gateway_ip: Ipv4Address,
 }
 
 struct PolicyUpdate {
-    rules: PrefixMap<Ipv4Net, Action>,
-    allow: Vec<Target>,
-    block: Vec<Target>,
+    rules: Rules,
+    allow: Vec<Rule>,
+    block: Vec<Rule>,
 }
 
 impl Policy {
-    pub(super) fn new(gateway_ip: Ipv4Address, allow: Vec<Target>, block: Vec<Target>) -> Self {
-        let allow = normalize_targets(allow);
-        let block = normalize_targets(block);
+    pub(super) fn new(gateway_ip: Ipv4Address, allow: Vec<Rule>, block: Vec<Rule>) -> Self {
+        let allow = normalize_rules(allow);
+        let block = normalize_rules(block);
 
         Policy {
             allow,
@@ -53,16 +51,16 @@ impl Policy {
         allow: Vec<String>,
         block: Vec<String>,
     ) -> std::result::Result<PolicyUpdate, ErrorObjectOwned> {
-        if allow.len() + block.len() > MAX_TARGETS {
+        if allow.len() + block.len() > MAX_RULES {
             return Err(rpc_error(
                 INVALID_PARAMS,
-                format!("allow and block may contain at most {MAX_TARGETS} targets combined"),
+                format!("allow and block may contain at most {MAX_RULES} rules combined"),
             ));
         }
 
-        let allow = parse_targets(allow)?;
-        let block = parse_targets(block)?;
-        let rules = build_rules(self.gateway_ip, &allow, &block);
+        let allow = parse_rules(allow)?;
+        let block = parse_rules(block)?;
+        let rules = Rules::new(self.gateway_ip, &allow, &block);
 
         Ok(PolicyUpdate {
             rules,
@@ -71,12 +69,15 @@ impl Policy {
         })
     }
 
-    fn apply(&mut self, update: PolicyUpdate) -> PrefixMap<Ipv4Net, Action> {
+    fn apply(&mut self, update: PolicyUpdate) -> Option<Rules> {
         // Build and validate everything before updating any active state. The packet filter
-        // observes either the old PrefixMap or the complete new one.
+        // observes either the old rule set or the complete new one.
+        let changed = self.allow != update.allow || self.block != update.block;
+
         self.allow = update.allow;
         self.block = update.block;
-        update.rules
+
+        changed.then_some(update.rules)
     }
 
     fn result(&self, rule_count: usize) -> Value {
@@ -90,78 +91,34 @@ impl PolicyUpdate {
     }
 }
 
-fn policy_result(allow: &[Target], block: &[Target], rule_count: usize) -> Value {
+fn policy_result(allow: &[Rule], block: &[Rule], rule_count: usize) -> Value {
     json!({
-        "allow": allow.iter().map(target_string).collect::<Vec<_>>(),
-        "block": block.iter().map(target_string).collect::<Vec<_>>(),
+        "allow": allow.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "block": block.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "ruleCount": rule_count,
     })
 }
 
-fn parse_targets(targets: Vec<String>) -> std::result::Result<Vec<Target>, ErrorObjectOwned> {
-    let mut parsed = Vec::with_capacity(targets.len());
+fn parse_rules(rules: Vec<String>) -> std::result::Result<Vec<Rule>, ErrorObjectOwned> {
+    let mut parsed = Vec::with_capacity(rules.len());
 
-    for target in targets {
-        let parsed_target = target.parse().map_err(|_| {
+    for rule in rules {
+        let parsed_rule = rule.parse().map_err(|_| {
             rpc_error(
                 INVALID_PARAMS,
-                format!("invalid target {target:?}: expected an IPv4 CIDR or @host"),
+                format!("invalid rule {rule:?}: expected TARGET, \"in TARGET\", or \"out TARGET\""),
             )
         })?;
-        parsed.push(parsed_target);
+        parsed.push(parsed_rule);
     }
 
-    Ok(normalize_targets(parsed))
+    Ok(normalize_rules(parsed))
 }
 
-fn normalize_targets(targets: Vec<Target>) -> Vec<Target> {
-    let mut targets = targets
-        .into_iter()
-        .map(|target| match target {
-            Target::Prefix(prefix) => Target::Prefix(prefix.trunc()),
-            Target::Host => Target::Host,
-        })
-        .collect::<Vec<_>>();
-
-    targets.sort_by_key(target_string);
-    targets.dedup();
-    targets
-}
-
-fn target_string(target: &Target) -> String {
-    match target {
-        Target::Prefix(prefix) => prefix.to_string(),
-        Target::Host => "@host".to_string(),
-    }
-}
-
-fn build_rules(
-    gateway_ip: Ipv4Address,
-    allow: &[Target],
-    block: &[Target],
-) -> PrefixMap<Ipv4Net, Action> {
-    let mut rules = PrefixMap::new();
-
-    for target in allow {
-        let prefix = match target {
-            Target::Prefix(prefix) => *prefix,
-            Target::Host => gateway_ip.into(),
-        };
-
-        rules.insert(prefix, Action::Allow);
-    }
-
-    // SECURITY: blocking rules must always take precedence over allowing rules when prefixes
-    // are identical, including @host and an explicit prefix for the gateway address.
-    for target in block {
-        let prefix = match target {
-            Target::Prefix(prefix) => *prefix,
-            Target::Host => gateway_ip.into(),
-        };
-
-        rules.insert(prefix, Action::Block);
-    }
-
+pub(super) fn normalize_rules(mut rules: Vec<Rule>) -> Vec<Rule> {
+    rules.iter_mut().for_each(|rule| *rule = rule.normalized());
+    rules.sort_by_key(ToString::to_string);
+    rules.dedup();
     rules
 }
 
@@ -173,14 +130,15 @@ pub(super) struct Control {
     output_offset: usize,
     discarding_input: bool,
     input_closed: bool,
+    policy_changed: bool,
 }
 
 impl Control {
     pub(super) fn new(
         control_fd: RawFd,
         gateway_ip: Ipv4Address,
-        allow: Vec<Target>,
-        block: Vec<Target>,
+        allow: Vec<Rule>,
+        block: Vec<Rule>,
     ) -> Result<Self> {
         let control_fd = duplicate_control_fd(control_fd)?;
 
@@ -196,10 +154,11 @@ impl Control {
             output_offset: 0,
             discarding_input: false,
             input_closed: false,
+            policy_changed: false,
         })
     }
 
-    pub(super) fn service(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<bool> {
+    pub(super) fn service(&mut self, rules: &mut Rules) -> Result<bool> {
         if !self.flush()? {
             return Ok(false);
         }
@@ -262,7 +221,12 @@ impl Control {
             .context("failed to shut down the control socket")
     }
 
-    fn process_input(&mut self, rules: &mut PrefixMap<Ipv4Net, Action>) -> Result<bool> {
+    /// Returns whether the policy changed and clears the change flag.
+    pub(super) fn policy_changed(&mut self) -> bool {
+        std::mem::take(&mut self.policy_changed)
+    }
+
+    fn process_input(&mut self, rules: &mut Rules) -> Result<bool> {
         loop {
             if self.discarding_input {
                 if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
@@ -311,11 +275,14 @@ impl Control {
                 continue;
             }
 
-            let (response, update) = handle_request(&self.policy, rules.len(), &line[..newline]);
+            let (response, update) = handle_request(&self.policy, rules, &line[..newline]);
             self.enqueue(response)?;
 
-            if let Some(update) = update {
-                *rules = self.policy.apply(update);
+            if let Some(update) = update
+                && let Some(updated_rules) = self.policy.apply(update)
+            {
+                *rules = updated_rules;
+                self.policy_changed = true;
             }
 
             if !self.flush()? {
@@ -384,11 +351,7 @@ struct SetParams {
     block: Vec<String>,
 }
 
-fn handle_request(
-    policy: &Policy,
-    rule_count: usize,
-    line: &[u8],
-) -> (Value, Option<PolicyUpdate>) {
+fn handle_request(policy: &Policy, rules: &Rules, line: &[u8]) -> (Value, Option<PolicyUpdate>) {
     let value = match serde_json::from_slice::<Value>(line) {
         Ok(value) => value,
         Err(_) => {
@@ -425,7 +388,7 @@ fn handle_request(
                     "softnet.policy.get does not accept parameters",
                 ))
             } else {
-                Ok(policy.result(rule_count))
+                Ok(policy.result(rules.len()))
             }
         }
         "softnet.policy.set" => {
@@ -571,11 +534,9 @@ fn validate_control_fd(control_fd: RawFd) -> Result<()> {
 mod tests {
     use super::{
         Control, INVALID_PARAMS, INVALID_REQUEST, MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES,
-        MAX_TARGETS, METHOD_NOT_FOUND, PARSE_ERROR, Policy, build_rules, handle_request,
+        MAX_RULES, METHOD_NOT_FOUND, PARSE_ERROR, Policy, handle_request,
     };
-    use crate::proxy::{Action, Target};
-    use ipnet::Ipv4Net;
-    use prefix_trie::PrefixMap;
+    use crate::proxy::{Direction, PolicyDecision, Rule, Rules};
     use serde_json::{Value, json};
     use smoltcp::wire::Ipv4Address;
     use std::fs::File;
@@ -583,12 +544,11 @@ mod tests {
     use std::net::{Shutdown, TcpListener};
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
-    use std::str::FromStr;
     use std::time::Duration;
 
     struct TestPolicy {
         state: Policy,
-        rules: PrefixMap<Ipv4Net, Action>,
+        rules: Rules,
     }
 
     impl TestPolicy {
@@ -605,20 +565,17 @@ mod tests {
         }
     }
 
-    fn targets(targets: &[&str]) -> Vec<Target> {
-        targets
-            .iter()
-            .map(|target| target.parse().unwrap())
-            .collect()
+    fn rules(rules: &[&str]) -> Vec<Rule> {
+        rules.iter().map(|rule| rule.parse().unwrap()).collect()
     }
 
     fn policy(allow: &[&str], block: &[&str]) -> TestPolicy {
         let gateway_ip = Ipv4Address::new(192, 168, 64, 1);
-        let allow = targets(allow);
-        let block = targets(block);
+        let allow = rules(allow);
+        let block = rules(block);
 
         TestPolicy {
-            rules: build_rules(gateway_ip, &allow, &block),
+            rules: Rules::new(gateway_ip, &allow, &block),
             state: Policy::new(gateway_ip, allow, block),
         }
     }
@@ -637,9 +594,11 @@ mod tests {
     }
 
     fn raw_request(policy: &mut TestPolicy, line: &[u8]) -> Value {
-        let (response, update) = handle_request(&policy.state, policy.rules.len(), line);
-        if let Some(update) = update {
-            policy.rules = policy.state.apply(update);
+        let (response, update) = handle_request(&policy.state, &policy.rules, line);
+        if let Some(update) = update
+            && let Some(rules) = policy.state.apply(update)
+        {
+            policy.rules = rules;
         }
 
         response
@@ -684,19 +643,21 @@ mod tests {
         assert_eq!(response["result"]["ruleCount"], 2);
 
         assert_eq!(
-            policy.rules.get(&Ipv4Net::from_str("10.0.0.0/8").unwrap()),
-            Some(&Action::Block)
+            policy
+                .rules
+                .policy_decision(Ipv4Address::new(10, 0, 0, 1), Direction::Out),
+            Some(PolicyDecision::Block)
         );
         assert_eq!(
             policy
                 .rules
-                .get(&Ipv4Net::from_str("192.168.64.1/32").unwrap()),
-            Some(&Action::Block)
+                .policy_decision(Ipv4Address::new(192, 168, 64, 1), Direction::Out),
+            Some(PolicyDecision::Block)
         );
     }
 
     #[test]
-    fn set_normalizes_targets() {
+    fn set_normalizes_rules() {
         let mut policy = policy(&[], &[]);
 
         let first = request(
@@ -722,7 +683,41 @@ mod tests {
     }
 
     #[test]
-    fn invalid_targets_and_limits_leave_policy_unchanged() {
+    fn set_supports_directional_rules_and_counts_logical_rules() {
+        let mut policy = policy(&[], &[]);
+
+        let response = request(
+            &mut policy,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "softnet.policy.set",
+                "params": {
+                    "allow": ["in 10.1.2.3/8", "out 10.0.0.0/8"],
+                    "block": ["in 10.0.0.0/8"]
+                }
+            }),
+        );
+
+        assert_eq!(
+            response["result"]["allow"],
+            json!(["in 10.0.0.0/8", "out 10.0.0.0/8"])
+        );
+        assert_eq!(response["result"]["block"], json!(["in 10.0.0.0/8"]));
+        assert_eq!(response["result"]["ruleCount"], 2);
+        let target = Ipv4Address::new(10, 1, 2, 3);
+        assert_eq!(
+            policy.rules.policy_decision(target, Direction::In),
+            Some(PolicyDecision::Block)
+        );
+        assert_eq!(
+            policy.rules.policy_decision(target, Direction::Out),
+            Some(PolicyDecision::AllowStateful)
+        );
+    }
+
+    #[test]
+    fn invalid_rules_and_limits_leave_policy_unchanged() {
         let mut policy = policy(&["@host"], &["0.0.0.0/0"]);
         let before = policy.result();
 
@@ -738,14 +733,14 @@ mod tests {
         assert_eq!(invalid["error"]["code"], INVALID_PARAMS);
         assert_eq!(policy.result(), before);
 
-        let targets = vec!["10.0.0.0/8"; MAX_TARGETS + 1];
+        let rules = vec!["10.0.0.0/8"; MAX_RULES + 1];
         let too_many = request(
             &mut policy,
             json!({
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "softnet.policy.set",
-                "params": {"allow": targets, "block": []}
+                "params": {"allow": rules, "block": []}
             }),
         );
         assert_eq!(too_many["error"]["code"], INVALID_PARAMS);
@@ -879,7 +874,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
 
         client
             .write_all(
@@ -903,12 +898,38 @@ mod tests {
         assert_eq!(lines[0]["id"], 1);
         assert_eq!(lines[1]["id"], 2);
         assert_eq!(lines[1]["result"]["allow"], json!(["@host"]));
-        assert_eq!(control.policy.allow, vec![Target::Host]);
+        assert_eq!(control.policy.allow, vec!["@host".parse().unwrap()]);
 
         let before = control.policy.result(rules.len());
         drop(client);
         assert!(!control.service(&mut rules).unwrap());
         assert_eq!(control.policy.result(rules.len()), before);
+    }
+
+    #[test]
+    fn policy_change_detection_uses_normalized_policy() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = Rules::default();
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"out 10.1.2.3/8\"],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
+            .unwrap();
+        assert!(control.service(&mut rules).unwrap());
+        assert!(control.policy_changed());
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"out 10.0.0.0/8\"],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
+            .unwrap();
+        assert!(control.service(&mut rules).unwrap());
+        assert!(!control.policy_changed());
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
+            .unwrap();
+        assert!(control.service(&mut rules).unwrap());
+        assert!(control.policy_changed());
+        assert!(control.policy.allow.is_empty());
     }
 
     #[test]
@@ -918,7 +939,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
 
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n")
@@ -942,7 +963,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
 
         control.input = vec![b'x'; MAX_REQUEST_BYTES + 1];
         control.process_input(&mut rules).unwrap();
@@ -973,7 +994,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
 
         client
@@ -993,7 +1014,7 @@ mod tests {
         let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["allow"], json!(["@host"]));
-        assert_eq!(control.policy.allow, vec![Target::Host]);
+        assert_eq!(control.policy.allow, vec!["@host".parse().unwrap()]);
     }
 
     #[test]
@@ -1026,8 +1047,8 @@ mod tests {
     fn pipelined_policy_responses_stop_before_queue_overflow() {
         let (_client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
-        let allow = (0..MAX_TARGETS)
+        let mut rules = Rules::default();
+        let allow = (0..MAX_RULES)
             .map(|index| format!("10.{}.{}.0/24", index / 256, index % 256))
             .collect::<Vec<_>>();
         let mut input = serde_json::to_vec(&json!({
@@ -1048,7 +1069,7 @@ mod tests {
 
         control.input = input;
         assert!(control.process_input(&mut rules).unwrap());
-        assert_eq!(rules.len(), MAX_TARGETS);
+        assert_eq!(rules.len(), MAX_RULES);
         assert!(!control.input.is_empty());
         assert!(!control.output.is_empty());
         assert!(control.output.len() - control.output_offset <= MAX_PENDING_RESPONSE_BYTES);
@@ -1058,7 +1079,7 @@ mod tests {
     fn response_queue_overflow_does_not_apply_a_policy_update() {
         let (_client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
 
         control.output = vec![b'x'; MAX_PENDING_RESPONSE_BYTES];
@@ -1077,7 +1098,7 @@ mod tests {
     fn response_backpressure_stops_consuming_policy_updates() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
-        let mut rules = PrefixMap::new();
+        let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
 
         control.output = vec![b'x'; MAX_REQUEST_BYTES];

@@ -30,6 +30,33 @@ And assumes that:
 
 ...otherwise it's possible for two VMs to receive an identical IP-address from the macOS built-in DHCP-server (even in the presence of Softnet's packet filtering) and thus bypass the protections offered by Softnet.
 
+### Stateful flow authorization
+
+Stateful `in`/`out` rules use a bounded authorization cache that records the
+direction and exact transport tuple of policy-approved flows, allowing matching
+return traffic without treating it as a new flow and thus requiring a separate
+policy entry. It is not a complete TCP connection tracker: endpoint transport
+stacks remain responsible for validating sequence numbers, receive windows,
+resets, and application-level traffic.
+
+This cache deliberately favors security, bounded resource use, and a simple
+implementation over availability. Only policy-authorized initiator traffic
+renews an entry; return traffic does not. Softnet does not maintain fairness
+quotas, eviction heuristics, or complete TCP lifecycle state.
+
+A packet admitted by a stateful rule is denied when Softnet cannot represent its
+flow, including when the cache is full. High flow churn, long idle connections,
+or ambiguous retransmissions may therefore interrupt networking and require the
+affected VM to reconnect.
+
+For TCP, a bare TCP SYN on an existing tuple is deliberately returned to policy
+because Softnet cannot distinguish a retransmission from tuple reuse without
+tracking TCP sequence state. If authorized, it may replace the tuple's previous
+cache lifetime; this can reduce availability but cannot grant traffic that
+policy did not permit.
+
+For ICMP, stateful flow authorization supports only echo requests and replies.
+
 ## Installing
 
 For proper functioning, Softnet binary requires two things:
@@ -46,7 +73,7 @@ Softnet is started and managed automatically by Tart if `--net-softnet` flag is 
 
 ### Dynamic network policy
 
-Softnet can update the running VM's IPv4 egress policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
+Softnet can update the running VM's IPv4 policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
 
 The supported methods are `softnet.policy.get` and `softnet.policy.set`. A complete policy update looks like this (each request and response occupies one line):
 
@@ -55,6 +82,8 @@ The supported methods are `softnet.policy.get` and `softnet.policy.set`. A compl
 {"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
 ```
 
-Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all targets are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical prefixes are preserved. Targets are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block targets, and a request frame may not exceed 1 MiB.
+Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all rules are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical rules are preserved. Rules are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block rules, and a request frame may not exceed 1 MiB.
 
-Use `block=["0.0.0.0/0"]` with specific allow targets for a default-deny policy. Closing the control socket leaves the last accepted policy active.
+When the normalized allow or block policy changes, Softnet clears the flow table so the new policy applies to established flows immediately. This may interrupt active connections. Repeating the same normalized policy is a no-op and preserves the flow table.
+
+Use `block=["0.0.0.0/0"]` with specific allow rules for a default-deny egress policy. Closing the control socket leaves the last accepted policy active.
