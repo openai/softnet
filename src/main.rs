@@ -8,7 +8,6 @@ use softnet::NetType;
 use softnet::proxy::ExposedPort;
 use softnet::proxy::Proxy;
 use softnet::proxy::Rule;
-use std::borrow::Cow;
 use std::env;
 use std::os::raw::c_int;
 use std::os::unix::io::RawFd;
@@ -130,10 +129,10 @@ fn main() -> ExitCode {
     }
 
     // Initialize Sentry
-    let _sentry = sentry::init(sentry::ClientOptions {
-        release: option_env!("CIRRUS_TAG").map(|tag| Cow::from(format!("softnet@{tag}"))),
-        ..Default::default()
-    });
+    let _sentry = sentry::init(
+        sentry::ClientOptions::default()
+            .maybe_release(option_env!("CIRRUS_TAG").map(|tag| format!("softnet@{tag}"))),
+    );
 
     // Enrich future events with Cirrus CI-specific tags
     if let Ok(tags) = env::var("CIRRUS_SENTRY_TAGS") {
