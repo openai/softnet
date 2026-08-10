@@ -1,5 +1,5 @@
 use dhcproto::Decodable;
-use dhcproto::v4::{DhcpOption, HType, MessageType, Opcode, OptionCode};
+use dhcproto::v4::{DhcpOption, HType, Message, MessageType, Opcode, OptionCode};
 use smoltcp::wire::Ipv4Address;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -32,11 +32,7 @@ impl DhcpSnooper {
         // hardware address to avoid acting on another VM's lease transition
         //
         // [1]: https://datatracker.ietf.org/doc/html/rfc2131#section-4.1
-        if message.opcode() != Opcode::BootReply
-            || message.htype() != HType::Eth
-            || message.hlen() != self.vm_mac_address.len() as u8
-            || message.chaddr() != self.vm_mac_address
-        {
+        if !message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address) {
             return;
         }
 
@@ -118,6 +114,17 @@ impl Lease {
     pub fn is_valid_for(&self, address: Ipv4Address) -> bool {
         self.address == address && self.valid()
     }
+}
+
+pub(crate) fn message_matches_bootp_client(
+    message: &Message,
+    opcode: Opcode,
+    mac: [u8; 6],
+) -> bool {
+    message.opcode() == opcode
+        && message.htype() == HType::Eth
+        && message.hlen() == mac.len() as u8
+        && message.chaddr() == mac
 }
 
 #[cfg(test)]
