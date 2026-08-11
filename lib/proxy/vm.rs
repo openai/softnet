@@ -1,9 +1,11 @@
-use crate::dhcp_snooper::Lease;
+use crate::dhcp_snooper::{Lease, message_matches_bootp_client};
 use crate::proxy::flows::{FlowDirection, FlowMatch};
 use crate::proxy::udp_packet_helper::UdpPacketHelper;
 use crate::proxy::{Direction, PolicyDecision, Proxy};
 use anyhow::Context;
 use anyhow::Result;
+use dhcproto::Decodable;
+use dhcproto::v4::Opcode;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address,
@@ -61,7 +63,12 @@ impl Proxy<'_> {
         {
             // Unicast DHCP renewal is required to maintain the VM's lease
             // and must bypass user-specified rules
-            if is_allowed_dhcp_request(&ipv4_pkt, Some(self.host.gateway_ip)) {
+            if is_allowed_dhcp_request(
+                &ipv4_pkt,
+                Some(self.host.gateway_ip),
+                self.vm_mac_address,
+                self.dhcp_snooper.lease(),
+            ) {
                 return Some(());
             }
 
@@ -123,7 +130,12 @@ impl Proxy<'_> {
 
         // Allow outgoing DHCP requests to the bootpd(8) broadcast address,
         // otherwise DHCP snooper will never be populated
-        if is_allowed_dhcp_request(&ipv4_pkt, None) {
+        if is_allowed_dhcp_request(
+            &ipv4_pkt,
+            None,
+            self.vm_mac_address,
+            self.dhcp_snooper.lease(),
+        ) {
             return Some(());
         }
 
@@ -134,7 +146,20 @@ impl Proxy<'_> {
 fn is_allowed_dhcp_request(
     ipv4_pkt: &Ipv4Packet<&[u8]>,
     unicast_target: Option<Ipv4Address>,
+    vm_mac_address: smoltcp::wire::EthernetAddress,
+    lease: &Option<Lease>,
 ) -> bool {
+    // Require the source address to be either:
+    // * covered by the VM's current lease
+    // * unspecified on the broadcast DHCP path
+    let src_addr = ipv4_pkt.src_addr();
+    let src_has_valid_lease = lease
+        .as_ref()
+        .is_some_and(|lease| lease.is_valid_for(src_addr));
+    if !src_has_valid_lease && !(unicast_target.is_none() && src_addr.is_unspecified()) {
+        return false;
+    }
+
     let dst_addr = ipv4_pkt.dst_addr();
 
     // Keep the common path cheap and inspect UDP only for a permitted DHCP target
@@ -150,7 +175,18 @@ fn is_allowed_dhcp_request(
         return false;
     };
 
-    udp_pkt.is_dhcp_request()
+    // Require the standard DHCP client and server ports
+    if !udp_pkt.is_dhcp_request() {
+        return false;
+    }
+
+    // Require the BOOTP client hardware address to match this VM
+    let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
+    let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
+        return false;
+    };
+
+    message_matches_bootp_client(&message, Opcode::BootRequest, vm_mac_address.0)
 }
 
 fn vm_arp_allowed(
@@ -191,6 +227,8 @@ fn vm_arp_allowed(
 #[cfg(test)]
 mod tests {
     use crate::dhcp_snooper::Lease;
+    use dhcproto::v4::{DhcpOption, Message, MessageType};
+    use dhcproto::{Encodable, Encoder};
     use smoltcp::wire::{
         ArpHardware, ArpOperation, ArpPacket, EthernetAddress, EthernetProtocol, IpProtocol,
         Ipv4Address, Ipv4Packet, UdpPacket,
@@ -198,15 +236,31 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    #[test]
-    fn test_allowed_dhcp_request_targets() {
-        let gateway = Ipv4Address::new(192, 168, 64, 1);
-        let other = Ipv4Address::new(192, 168, 64, 2);
+    const VM_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
-        assert!(allowed_dhcp_request(Ipv4Address::BROADCAST, None));
-        assert!(allowed_dhcp_request(gateway, Some(gateway)));
-        assert!(!allowed_dhcp_request(gateway, None));
-        assert!(!allowed_dhcp_request(other, Some(gateway)));
+    #[test]
+    fn test_allowed_dhcp_request_policy() {
+        let gateway = Ipv4Address::new(192, 168, 64, 1);
+        let lease_ip = Ipv4Address::new(192, 168, 64, 2);
+        let other = Ipv4Address::new(192, 168, 64, 3);
+        let no_lease = None;
+        let lease = Some(Lease::new(
+            lease_ip,
+            Duration::from_secs(600),
+            HashSet::new(),
+        ));
+        let initial = |src, chaddr| {
+            allowed_dhcp_request(src, Ipv4Address::BROADCAST, None, chaddr, &no_lease)
+        };
+        let renewal = |src, dst| allowed_dhcp_request(src, dst, Some(gateway), VM_MAC.0, &lease);
+        let other_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+        assert!(initial(Ipv4Address::UNSPECIFIED, VM_MAC.0));
+        assert!(renewal(lease_ip, gateway));
+        assert!(!renewal(other, gateway));
+        assert!(!renewal(Ipv4Address::UNSPECIFIED, gateway));
+        assert!(!renewal(lease_ip, other));
+        assert!(!initial(Ipv4Address::UNSPECIFIED, other_mac));
     }
 
     #[test]
@@ -308,21 +362,54 @@ mod tests {
         buf
     }
 
-    fn allowed_dhcp_request(dst_addr: Ipv4Address, unicast_target: Option<Ipv4Address>) -> bool {
-        let mut buf = vec![0; 28];
+    fn allowed_dhcp_request(
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        unicast_target: Option<Ipv4Address>,
+        chaddr: [u8; 6],
+        lease: &Option<Lease>,
+    ) -> bool {
+        let mut buf = dhcp_request(chaddr);
+        let mut ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_mut_slice());
+        ipv4_pkt.set_src_addr(src_addr);
+        ipv4_pkt.set_dst_addr(dst_addr);
+
+        let ipv4_pkt = Ipv4Packet::new_checked(buf.as_slice()).unwrap();
+        super::is_allowed_dhcp_request(&ipv4_pkt, unicast_target, VM_MAC, lease)
+    }
+
+    fn dhcp_request(chaddr: [u8; 6]) -> Vec<u8> {
+        let mut message = Message::new(
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            &chaddr,
+        );
+        message
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Discover));
+
+        let mut dhcp_payload = Vec::new();
+        message
+            .encode(&mut Encoder::new(&mut dhcp_payload))
+            .unwrap();
+
+        let total_len = 20 + 8 + dhcp_payload.len();
+        let mut buf = vec![0; total_len];
         let mut ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_mut_slice());
         ipv4_pkt.set_version(4);
         ipv4_pkt.set_header_len(20);
-        ipv4_pkt.set_total_len(28);
+        ipv4_pkt.set_total_len(total_len as u16);
         ipv4_pkt.set_next_header(IpProtocol::Udp);
-        ipv4_pkt.set_dst_addr(dst_addr);
+        ipv4_pkt.set_src_addr(Ipv4Address::UNSPECIFIED);
+        ipv4_pkt.set_dst_addr(Ipv4Address::BROADCAST);
 
         let mut udp_pkt = UdpPacket::new_unchecked(ipv4_pkt.payload_mut());
         udp_pkt.set_src_port(68);
         udp_pkt.set_dst_port(67);
-        udp_pkt.set_len(8);
-
-        let ipv4_pkt = Ipv4Packet::new_checked(buf.as_slice()).unwrap();
-        super::is_allowed_dhcp_request(&ipv4_pkt, unicast_target)
+        udp_pkt.set_len((8 + dhcp_payload.len()) as u16);
+        udp_pkt.payload_mut().copy_from_slice(&dhcp_payload);
+        buf
     }
 }

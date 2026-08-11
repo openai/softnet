@@ -14,11 +14,15 @@ use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use system_configuration::core_foundation::base::TCFType;
+use system_configuration::core_foundation::boolean::CFBoolean;
 use system_configuration::core_foundation::dictionary::CFDictionary;
 use system_configuration::core_foundation::number::CFNumber;
 use system_configuration::core_foundation::string::CFString;
 use system_configuration::preferences::SCPreferences;
-use system_configuration::sys::preferences::{SCPreferencesCommitChanges, SCPreferencesSetValue};
+use system_configuration::sys::preferences::{
+    SCPreferencesApplyChanges, SCPreferencesCommitChanges, SCPreferencesLock,
+    SCPreferencesSetValue, SCPreferencesUnlock,
+};
 use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 
 #[derive(Parser, Debug)]
@@ -215,8 +219,8 @@ fn try_main() -> anyhow::Result<()> {
         ));
     }
 
-    // Set bootpd(8) min/max lease time while still having the root privileges
-    set_bootpd_lease_time(args.bootpd_lease_time);
+    // Configure bootpd(8) while still having the root privileges
+    configure_bootpd(args.bootpd_lease_time)?;
 
     // Initialize the proxy while still having the root privileges
     let mut proxy = Proxy::new(
@@ -268,26 +272,59 @@ fn sudo_escalation_works() -> bool {
         .unwrap_or(false)
 }
 
-fn set_bootpd_lease_time(lease_time: u32) {
+fn configure_bootpd(lease_time: u32) -> anyhow::Result<()> {
     let prefs = SCPreferences::group(
         &CFString::new("softnet"),
         &CFString::new("com.apple.InternetSharing.default.plist"),
     );
 
-    let bootpd_dict = CFDictionary::from_CFType_pairs(&[(
-        CFString::new("DHCPLeaseTimeSecs"),
-        CFNumber::from(lease_time as i32),
-    )]);
+    let bootpd_dict = CFDictionary::from_CFType_pairs(&[
+        (
+            CFString::new("DHCPLeaseTimeSecs"),
+            CFNumber::from(lease_time as i32).as_CFType(),
+        ),
+        (
+            CFString::new("dhcp_ignore_client_identifier"),
+            CFBoolean::true_value().as_CFType(),
+        ),
+    ]);
 
     unsafe {
-        SCPreferencesSetValue(
-            prefs.as_concrete_TypeRef(),
-            CFString::new("bootpd").as_concrete_TypeRef(),
-            bootpd_dict.as_concrete_TypeRef().cast(),
+        let prefs = prefs.as_concrete_TypeRef();
+        anyhow::ensure!(
+            SCPreferencesLock(prefs, 1) != 0,
+            "failed to lock bootpd preferences"
         );
 
-        SCPreferencesCommitChanges(prefs.as_concrete_TypeRef());
+        let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                SCPreferencesSetValue(
+                    prefs,
+                    CFString::new("bootpd").as_concrete_TypeRef(),
+                    bootpd_dict.as_concrete_TypeRef().cast(),
+                ) != 0,
+                "failed to set bootpd preferences"
+            );
+
+            anyhow::ensure!(
+                SCPreferencesCommitChanges(prefs) != 0,
+                "failed to commit bootpd preferences"
+            );
+
+            anyhow::ensure!(
+                SCPreferencesApplyChanges(prefs) != 0,
+                "failed to apply bootpd preferences"
+            );
+
+            Ok(())
+        })();
+
+        let unlocked = SCPreferencesUnlock(prefs) != 0;
+        result?;
+        anyhow::ensure!(unlocked, "failed to unlock bootpd preferences");
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
