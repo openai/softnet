@@ -14,6 +14,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use system_configuration::core_foundation::base::TCFType;
+use system_configuration::core_foundation::boolean::CFBoolean;
 use system_configuration::core_foundation::dictionary::CFDictionary;
 use system_configuration::core_foundation::number::CFNumber;
 use system_configuration::core_foundation::string::CFString;
@@ -279,11 +280,11 @@ fn configure_bootpd(lease_time: u32) -> anyhow::Result<()> {
     let bootpd_dict = CFDictionary::from_CFType_pairs(&[
         (
             CFString::new("DHCPLeaseTimeSecs"),
-            CFNumber::from(lease_time as i32),
+            CFNumber::from(lease_time as i32).as_CFType(),
         ),
         (
             CFString::new("dhcp_ignore_client_identifier"),
-            CFNumber::from(1_i32),
+            CFBoolean::true_value().as_CFType(),
         ),
     ]);
 
