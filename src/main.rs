@@ -20,7 +20,8 @@ use system_configuration::core_foundation::number::CFNumber;
 use system_configuration::core_foundation::string::CFString;
 use system_configuration::preferences::SCPreferences;
 use system_configuration::sys::preferences::{
-    SCPreferencesApplyChanges, SCPreferencesCommitChanges, SCPreferencesSetValue,
+    SCPreferencesApplyChanges, SCPreferencesCommitChanges, SCPreferencesLock,
+    SCPreferencesSetValue, SCPreferencesUnlock,
 };
 use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 
@@ -289,24 +290,38 @@ fn configure_bootpd(lease_time: u32) -> anyhow::Result<()> {
     ]);
 
     unsafe {
+        let prefs = prefs.as_concrete_TypeRef();
         anyhow::ensure!(
-            SCPreferencesSetValue(
-                prefs.as_concrete_TypeRef(),
-                CFString::new("bootpd").as_concrete_TypeRef(),
-                bootpd_dict.as_concrete_TypeRef().cast(),
-            ) != 0,
-            "failed to set bootpd preferences"
+            SCPreferencesLock(prefs, 1) != 0,
+            "failed to lock bootpd preferences"
         );
 
-        anyhow::ensure!(
-            SCPreferencesCommitChanges(prefs.as_concrete_TypeRef()) != 0,
-            "failed to commit bootpd preferences"
-        );
+        let result = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                SCPreferencesSetValue(
+                    prefs,
+                    CFString::new("bootpd").as_concrete_TypeRef(),
+                    bootpd_dict.as_concrete_TypeRef().cast(),
+                ) != 0,
+                "failed to set bootpd preferences"
+            );
 
-        anyhow::ensure!(
-            SCPreferencesApplyChanges(prefs.as_concrete_TypeRef()) != 0,
-            "failed to apply bootpd preferences"
-        );
+            anyhow::ensure!(
+                SCPreferencesCommitChanges(prefs) != 0,
+                "failed to commit bootpd preferences"
+            );
+
+            anyhow::ensure!(
+                SCPreferencesApplyChanges(prefs) != 0,
+                "failed to apply bootpd preferences"
+            );
+
+            Ok(())
+        })();
+
+        let unlocked = SCPreferencesUnlock(prefs) != 0;
+        result?;
+        anyhow::ensure!(unlocked, "failed to unlock bootpd preferences");
     }
 
     Ok(())
