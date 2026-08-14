@@ -1,7 +1,10 @@
+use crate::dhcp_snooper::message_matches_bootp_client;
 use crate::proxy::flows::{FlowDirection, FlowMatch};
 use crate::proxy::udp_packet_helper::UdpPacketHelper;
 use crate::proxy::{Direction, PolicyDecision, Proxy};
 use anyhow::{Context, Result};
+use dhcproto::Decodable;
+use dhcproto::v4::Opcode;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
 
@@ -141,8 +144,75 @@ impl Proxy<'_> {
             return false;
         }
 
-        UdpPacket::new_checked(ipv4_pkt.payload())
-            .map(|udp_pkt| udp_pkt.is_dhcp_response())
-            .unwrap_or(false)
+        let Ok(udp_pkt) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
+            return false;
+        };
+
+        // Require the standard DHCP server and client ports
+        if !udp_pkt.is_dhcp_response() {
+            return false;
+        }
+
+        // Require the BOOTP client hardware address to match this VM
+        // (symmetric with is_allowed_dhcp_request / #191 on the VM→host path)
+        let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
+        let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
+            return false;
+        };
+
+        message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::dhcp_snooper::message_matches_bootp_client;
+    use dhcproto::Decodable;
+    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+    use dhcproto::{Encodable, Encoder};
+    use smoltcp::wire::Ipv4Address;
+
+    const VM_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+    const OTHER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+    #[test]
+    fn dhcp_boot_reply_chaddr_must_match_vm() {
+        let own = encode_boot_reply(VM_MAC);
+        let foreign = encode_boot_reply(OTHER_MAC);
+
+        let mut dec = dhcproto::v4::Decoder::new(&own);
+        let own_msg = Message::decode(&mut dec).unwrap();
+        let mut dec = dhcproto::v4::Decoder::new(&foreign);
+        let foreign_msg = Message::decode(&mut dec).unwrap();
+
+        assert!(message_matches_bootp_client(
+            &own_msg,
+            Opcode::BootReply,
+            VM_MAC
+        ));
+        assert!(!message_matches_bootp_client(
+            &foreign_msg,
+            Opcode::BootReply,
+            VM_MAC
+        ));
+    }
+
+    fn encode_boot_reply(chaddr: [u8; 6]) -> Vec<u8> {
+        let mut message = Message::new(
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::new(192, 168, 64, 2),
+            Ipv4Address::UNSPECIFIED,
+            Ipv4Address::UNSPECIFIED,
+            &chaddr,
+        );
+        message.set_opcode(Opcode::BootReply);
+        message
+            .opts_mut()
+            .insert(DhcpOption::MessageType(MessageType::Ack));
+        message.opts_mut().insert(DhcpOption::AddressLeaseTime(600));
+
+        let mut encoded = Vec::new();
+        message.encode(&mut Encoder::new(&mut encoded)).unwrap();
+        encoded
     }
 }
