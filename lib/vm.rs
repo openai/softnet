@@ -26,6 +26,14 @@ impl VM {
     pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.sock.recv(buf)
     }
+
+    pub fn is_connected(&self) -> io::Result<bool> {
+        match self.sock.peer_addr() {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn duplicate_vm_fd(vm_fd: RawFd) -> Result<RawFd> {
@@ -115,10 +123,12 @@ impl AsRawFd for VM {
 #[cfg(test)]
 mod tests {
     use super::VM;
+    use polling::{Event, Events, PollMode, Poller};
     use std::fs::File;
     use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixDatagram, UnixStream};
+    use std::time::Duration;
 
     #[test]
     fn test_new_rejects_negative_fd() {
@@ -186,5 +196,63 @@ mod tests {
         }
 
         assert!(socket_fd_is_open);
+    }
+
+    #[test]
+    fn test_connected_socket_has_peer() {
+        let (socket, _peer) = UnixDatagram::pair().unwrap();
+        let vm = VM::new(socket.as_raw_fd()).unwrap();
+
+        assert!(vm.is_connected().unwrap());
+    }
+
+    #[test]
+    fn test_disconnected_peer_is_detected_without_kqueue_event() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        let vm = VM::new(socket.as_raw_fd()).unwrap();
+        let poller = Poller::new().unwrap();
+        let mut events = Events::new();
+
+        unsafe {
+            poller
+                .add_with_mode(vm.as_raw_fd(), Event::readable(0), PollMode::Edge)
+                .unwrap();
+        }
+        drop(peer);
+
+        poller
+            .wait(&mut events, Some(Duration::from_millis(20)))
+            .unwrap();
+
+        assert!(events.is_empty());
+        assert!(!vm.is_connected().unwrap());
+    }
+
+    #[test]
+    fn test_disconnected_peer_is_detected_when_another_socket_wakes_kqueue() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        let (host, host_peer) = UnixDatagram::pair().unwrap();
+        let vm = VM::new(socket.as_raw_fd()).unwrap();
+        let poller = Poller::new().unwrap();
+        let mut events = Events::new();
+
+        unsafe {
+            poller
+                .add_with_mode(vm.as_raw_fd(), Event::readable(0), PollMode::Edge)
+                .unwrap();
+            poller
+                .add_with_mode(host.as_raw_fd(), Event::readable(1), PollMode::Edge)
+                .unwrap();
+        }
+        drop(peer);
+        host_peer.send(&[1]).unwrap();
+
+        poller
+            .wait(&mut events, Some(Duration::from_millis(20)))
+            .unwrap();
+
+        assert!(events.iter().any(|event| event.key == 1));
+        assert!(!events.iter().any(|event| event.key == 0));
+        assert!(!vm.is_connected().unwrap());
     }
 }
