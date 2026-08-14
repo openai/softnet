@@ -209,9 +209,7 @@ mod tests {
         message
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Ack));
-        message
-            .opts_mut()
-            .insert(DhcpOption::AddressLeaseTime(600));
+        message.opts_mut().insert(DhcpOption::AddressLeaseTime(600));
 
         let mut encoded = Vec::new();
         message.encode(&mut Encoder::new(&mut encoded)).unwrap();
