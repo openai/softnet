@@ -25,7 +25,13 @@ use system_configuration::sys::preferences::{
 };
 use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 
+const VERSION: &str = match option_env!("SOFTNET_VERSION") {
+    Some(version) => version,
+    None => "unknown-unknown",
+};
+
 #[derive(Parser, Debug)]
+#[command(version = VERSION)]
 struct Args {
     #[clap(
         long,

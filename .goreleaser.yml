@@ -5,6 +5,8 @@ project_name: softnet
 builds:
   - builder: rust
     command: build
+    env:
+      - SOFTNET_VERSION={{ .Version }}-{{ .ShortCommit }}
     targets:
       - aarch64-apple-darwin
       - x86_64-apple-darwin
