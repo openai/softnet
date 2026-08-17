@@ -8,6 +8,13 @@ use dhcproto::v4::Opcode;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
 
+/// DhcpResponseDisposition distinguishes non-DHCP traffic from allowed and rejected DHCP replies.
+enum DhcpResponseDisposition {
+    NotDhcp,
+    Allow,
+    Reject,
+}
+
 impl Proxy<'_> {
     pub(crate) fn process_frame_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Result<()> {
         if self.allowed_from_host(frame).is_none() {
@@ -55,13 +62,14 @@ impl Proxy<'_> {
     }
 
     pub(super) fn allowed_from_host_ipv4(&mut self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> Option<()> {
-        // Backwards compatibility with Softnet consumers that only use stateless rules
-        if self.flows.is_none() {
-            return Some(());
+        match self.dhcp_response_disposition(ipv4_pkt) {
+            DhcpResponseDisposition::NotDhcp => { /* Fall through to generic policy */ }
+            DhcpResponseDisposition::Allow => return Some(()),
+            DhcpResponseDisposition::Reject => return None,
         }
 
-        // DHCP is required to maintain the VM's lease and must bypass user-specified rules
-        if self.is_allowed_dhcp_response(ipv4_pkt) {
+        // Backwards compatibility with Softnet consumers that only use stateless rules
+        if self.flows.is_none() {
             return Some(());
         }
 
@@ -119,8 +127,9 @@ impl Proxy<'_> {
             _ => return,
         };
 
-        if !self.is_allowed_dhcp_response(&ipv4_pkt) {
-            return;
+        match self.dhcp_response_disposition(&ipv4_pkt) {
+            DhcpResponseDisposition::Allow => { /* Continue snooping */ }
+            DhcpResponseDisposition::NotDhcp | DhcpResponseDisposition::Reject => return,
         }
 
         let udp_pkt = match UdpPacket::new_checked(ipv4_pkt.payload()) {
@@ -137,30 +146,34 @@ impl Proxy<'_> {
         }
     }
 
-    fn is_allowed_dhcp_response(&self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> bool {
+    fn dhcp_response_disposition(&self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> DhcpResponseDisposition {
         if ipv4_pkt.src_addr() != self.host.gateway_ip
             || ipv4_pkt.next_header() != smoltcp::wire::IpProtocol::Udp
         {
-            return false;
+            return DhcpResponseDisposition::NotDhcp;
         }
 
         let Ok(udp_pkt) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
-            return false;
+            return DhcpResponseDisposition::NotDhcp;
         };
 
         // Require the standard DHCP server and client ports
         if !udp_pkt.is_dhcp_response() {
-            return false;
+            return DhcpResponseDisposition::NotDhcp;
         }
 
         // Require the BOOTP client hardware address to match this VM
         // (symmetric with is_allowed_dhcp_request / #191 on the VM→host path)
         let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
         let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
-            return false;
+            return DhcpResponseDisposition::Reject;
         };
 
-        message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address.0)
+        if message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address.0) {
+            DhcpResponseDisposition::Allow
+        } else {
+            DhcpResponseDisposition::Reject
+        }
     }
 }
 
