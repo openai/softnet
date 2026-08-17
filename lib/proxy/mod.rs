@@ -108,11 +108,6 @@ impl Proxy<'_> {
         loop {
             let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
 
-            // kqueue does not report peer disconnects for Unix datagram sockets.
-            if !self.vm.is_connected()? {
-                return Ok(());
-            }
-
             // Update coarse time for DHCP snooping and flows
             coarsetime::Instant::update();
 
@@ -133,8 +128,13 @@ impl Proxy<'_> {
                 return Ok(());
             }
 
-            // Timeout
-            if !vm_readable && !host_readable && !interrupt {
+            // Periodic maintenance
+            if self.poller.periodic_tick_due() {
+                // kqueue(2) does not report peer disconnects for Unix datagram sockets
+                if !self.vm.is_connected()? {
+                    return Ok(());
+                }
+
                 self.port_forwarder
                     .tick(&mut self.host, self.dhcp_snooper.lease());
             }
