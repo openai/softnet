@@ -10,6 +10,7 @@ pub struct Poller<'poller> {
     poller: polling::Poller,
     events: polling::Events,
     timeout: Duration,
+    last_periodic_tick: coarsetime::Instant,
     vm_fd: BorrowedFd<'poller>,
     host_fd: BorrowedFd<'poller>,
     control_fd: Option<BorrowedFd<'poller>>,
@@ -37,6 +38,7 @@ impl Poller<'_> {
             poller,
             events: polling::Events::new(),
             timeout,
+            last_periodic_tick: coarsetime::Instant::recent(),
             vm_fd: unsafe { BorrowedFd::borrow_raw(vm_fd) },
             host_fd: unsafe { BorrowedFd::borrow_raw(host_fd) },
             control_fd: control_fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }),
@@ -92,6 +94,16 @@ impl Poller<'_> {
             .iter()
             .any(|ev| ev.key == Into::<usize>::into(EventKey::Interrupt));
         Ok((vm_readable, host_readable, interrupt))
+    }
+
+    pub fn periodic_tick_due(&mut self) -> bool {
+        let due = self.last_periodic_tick.elapsed_since_recent() >= self.timeout.into();
+
+        if due {
+            self.last_periodic_tick = coarsetime::Instant::recent();
+        }
+
+        due
     }
 
     pub fn remove_control(&mut self) -> Result<()> {
