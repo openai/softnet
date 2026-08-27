@@ -9,10 +9,15 @@ use softnet::proxy::ExposedPort;
 use softnet::proxy::Proxy;
 use softnet::proxy::Rule;
 use std::env;
+use std::io;
 use std::os::raw::c_int;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use system_configuration::core_foundation::base::TCFType;
 use system_configuration::core_foundation::boolean::CFBoolean;
 use system_configuration::core_foundation::dictionary::CFDictionary;
@@ -225,19 +230,20 @@ fn try_main() -> anyhow::Result<()> {
         ));
     }
 
-    // Configure bootpd(8) while still having the root privileges
-    configure_bootpd(args.bootpd_lease_time)?;
-
-    // Initialize the proxy while still having the root privileges
-    let mut proxy = Proxy::new(
-        args.vm_fd as RawFd,
-        args.vm_mac_address,
-        args.vm_net_type,
-        args.allow,
-        args.block,
-        args.expose,
-        args.control_fd.map(|fd| fd as RawFd),
-    )
+    // Monitor VM lifetime before entering potentially blocking native initialization.
+    let mut proxy = with_vm_disconnect_monitor(args.vm_fd as RawFd, || {
+        // Configure bootpd(8) and initialize the proxy while still privileged.
+        configure_bootpd(args.bootpd_lease_time)?;
+        Proxy::new(
+            args.vm_fd as RawFd,
+            args.vm_mac_address,
+            args.vm_net_type,
+            args.allow,
+            args.block,
+            args.expose,
+            args.control_fd.map(|fd| fd as RawFd),
+        )
+    })
     .context("failed to initialize proxy")?;
 
     // Drop effective privileges to the user
@@ -250,6 +256,43 @@ fn try_main() -> anyhow::Result<()> {
 
     // Run proxy
     proxy.run()
+}
+
+fn with_vm_disconnect_monitor<T>(
+    vm_fd: RawFd,
+    initialize: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    // SAFETY: fcntl duplicates the descriptor without taking ownership of vm_fd.
+    let monitor_fd = unsafe { libc::fcntl(vm_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if monitor_fd == -1 {
+        return Err(io::Error::last_os_error()).context("failed to duplicate VM socket");
+    }
+    // SAFETY: monitor_fd is a valid descriptor owned by this function.
+    let socket = unsafe { UnixDatagram::from_raw_fd(monitor_fd) };
+    socket.peer_addr().context("failed to inspect VM peer")?;
+
+    thread::scope(|scope| {
+        let (finished_tx, finished_rx) = mpsc::channel::<()>();
+        thread::Builder::new()
+            .name("vm-startup-monitor".into())
+            .spawn_scoped(scope, move || {
+                while matches!(
+                    finished_rx.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if matches!(socket.peer_addr(), Err(error) if error.kind() == io::ErrorKind::NotConnected)
+                    {
+                        // vmnet can wait forever for its startup callback, before Proxy::run
+                        // can detect the disconnect. Exit to release the inherited pipes.
+                        std::process::exit(0);
+                    }
+                }
+            })?;
+        let result = initialize();
+        drop(finished_tx);
+        // The scope joins the monitor before normal proxy operation and teardown.
+        result
+    })
 }
 
 fn parse_vm_fd(value: &str) -> Result<c_int, String> {
@@ -335,8 +378,105 @@ fn configure_bootpd(lease_time: u32) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, with_vm_disconnect_monitor};
     use clap::Parser;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::process::{Command, Output, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn run_startup_monitor_child(case: &str) -> Output {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::test_startup_monitor_child",
+                "--nocapture",
+            ])
+            .env("SOFTNET_TEST_STARTUP_MONITOR", case)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{case}: {output:?}");
+        output
+    }
+
+    #[test]
+    fn test_vm_disconnect_exits_during_blocked_startup() {
+        // A separate process is required because the monitor exits the binary.
+        // wait_with_output also verifies that its inherited stderr pipe closes.
+        let output = run_startup_monitor_child("disconnect");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("INITIALIZATION_BLOCKED"));
+    }
+
+    #[test]
+    fn test_startup_monitor_stops_after_success_or_error() {
+        for case in ["success", "error"] {
+            let output = run_startup_monitor_child(case);
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("MONITOR_STOPPED"),
+                "{case}: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_startup_monitor_rejects_already_disconnected_peer() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        drop(peer);
+        let result = with_vm_disconnect_monitor(socket.as_raw_fd(), || -> anyhow::Result<()> {
+            panic!("must not initialize after VM disconnect");
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_startup_monitor_child() {
+        let Ok(case) = std::env::var("SOFTNET_TEST_STARTUP_MONITOR") else {
+            return;
+        };
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        if case == "disconnect" {
+            with_vm_disconnect_monitor(socket.as_raw_fd(), || -> anyhow::Result<()> {
+                println!("INITIALIZATION_BLOCKED");
+                drop(peer);
+                // Model a native initializer that never invokes its callback.
+                loop {
+                    thread::park();
+                }
+            })
+            .unwrap();
+            panic!("blocked initializer must not return");
+        }
+
+        let result = with_vm_disconnect_monitor(socket.as_raw_fd(), || {
+            // A live VM must survive several monitor polls while startup is pending.
+            thread::sleep(Duration::from_millis(250));
+            if case == "error" {
+                anyhow::bail!("initialization failed");
+            }
+            Ok(42)
+        });
+        if case == "error" {
+            assert_eq!(result.unwrap_err().to_string(), "initialization failed");
+        } else {
+            assert_eq!(result.unwrap(), 42);
+        }
+        assert!(socket.peer_addr().is_ok());
+        drop(peer);
+        thread::sleep(Duration::from_millis(250));
+        println!("MONITOR_STOPPED");
+    }
 
     #[test]
     fn test_cli_rejects_negative_vm_fd_before_startup() {
