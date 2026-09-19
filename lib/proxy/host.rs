@@ -6,9 +6,12 @@ use anyhow::{Context, Result};
 use dhcproto::Decodable;
 use dhcproto::v4::Opcode;
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
+use smoltcp::wire::{
+    EthernetFrame, EthernetProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
+};
 
 /// DhcpResponseDisposition distinguishes non-DHCP traffic from allowed and rejected DHCP replies.
+#[derive(Debug, PartialEq, Eq)]
 enum DhcpResponseDisposition {
     NotDhcp,
     Allow,
@@ -147,44 +150,66 @@ impl Proxy<'_> {
     }
 
     fn dhcp_response_disposition(&self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> DhcpResponseDisposition {
-        if ipv4_pkt.src_addr() != self.host.gateway_ip
-            || ipv4_pkt.next_header() != smoltcp::wire::IpProtocol::Udp
-        {
-            return DhcpResponseDisposition::NotDhcp;
-        }
+        classify_dhcp_response(ipv4_pkt, self.host.gateway_ip, self.vm_mac_address.0)
+    }
+}
 
-        let Ok(udp_pkt) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
-            return DhcpResponseDisposition::NotDhcp;
-        };
+/// Classify an IPv4 packet coming from the host as a DHCP reply, a rejected DHCP reply,
+/// or as traffic that is not DHCP at all.
+fn classify_dhcp_response(
+    ipv4_pkt: &Ipv4Packet<&[u8]>,
+    gateway_ip: Ipv4Address,
+    vm_mac_address: [u8; 6],
+) -> DhcpResponseDisposition {
+    if ipv4_pkt.src_addr() != gateway_ip || ipv4_pkt.next_header() != smoltcp::wire::IpProtocol::Udp
+    {
+        return DhcpResponseDisposition::NotDhcp;
+    }
 
-        // Require the standard DHCP server and client ports
-        if !udp_pkt.is_dhcp_response() {
-            return DhcpResponseDisposition::NotDhcp;
-        }
+    // A fragmented gateway datagram cannot be classified here: the first fragment's
+    // UDP length covers the complete datagram, so it fails the length check below, and
+    // later fragments carry no UDP header at all. Reporting NotDhcp would send every
+    // fragment through the generic policy path, which unconditionally permits them
+    // when flows are disabled, letting the guest reassemble a foreign DHCP reply and
+    // bypass the BOOTP client check. Reject fragments instead.
+    if ipv4_pkt.more_frags() || ipv4_pkt.frag_offset() != 0 {
+        return DhcpResponseDisposition::Reject;
+    }
 
-        // Require the BOOTP client hardware address to match this VM
-        // (symmetric with is_allowed_dhcp_request / #191 on the VM→host path)
-        let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
-        let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
-            return DhcpResponseDisposition::Reject;
-        };
+    let Ok(udp_pkt) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
+        return DhcpResponseDisposition::NotDhcp;
+    };
 
-        if message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address.0) {
-            DhcpResponseDisposition::Allow
-        } else {
-            DhcpResponseDisposition::Reject
-        }
+    // Require the standard DHCP server and client ports
+    if !udp_pkt.is_dhcp_response() {
+        return DhcpResponseDisposition::NotDhcp;
+    }
+
+    // Require the BOOTP client hardware address to match this VM
+    // (symmetric with is_allowed_dhcp_request / #191 on the VM→host path)
+    let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
+    let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
+        return DhcpResponseDisposition::Reject;
+    };
+
+    if message_matches_bootp_client(&message, Opcode::BootReply, vm_mac_address) {
+        DhcpResponseDisposition::Allow
+    } else {
+        DhcpResponseDisposition::Reject
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{DhcpResponseDisposition, classify_dhcp_response};
     use crate::dhcp_snooper::message_matches_bootp_client;
     use dhcproto::Decodable;
     use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
     use dhcproto::{Encodable, Encoder};
-    use smoltcp::wire::Ipv4Address;
+    use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
 
+    const GATEWAY: Ipv4Address = Ipv4Address::new(192, 168, 64, 1);
+    const VM_IP: Ipv4Address = Ipv4Address::new(192, 168, 64, 2);
     const VM_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
     const OTHER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 
@@ -227,5 +252,100 @@ mod tests {
         let mut encoded = Vec::new();
         message.encode(&mut Encoder::new(&mut encoded)).unwrap();
         encoded
+    }
+
+    #[test]
+    fn fragmented_gateway_dhcp_reply_is_rejected() {
+        // Fragmentation must be rejected rather than reported as non-DHCP: the first
+        // fragment's UDP length covers the complete datagram, and later fragments carry
+        // no UDP header, so the BOOTP client check below can never run on them.
+        for (more_fragments, offset) in [(true, 0), (false, 8)] {
+            let mut bytes = dhcp_reply_packet(OTHER_MAC);
+            {
+                let mut packet = Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+                packet.set_more_frags(more_fragments);
+                packet.set_frag_offset(offset);
+            }
+
+            let packet = Ipv4Packet::new_checked(bytes.as_slice()).unwrap();
+            assert_eq!(
+                classify_dhcp_response(&packet, GATEWAY, VM_MAC),
+                DhcpResponseDisposition::Reject,
+                "more_fragments={more_fragments} offset={offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfragmented_gateway_dhcp_reply_is_still_classified_by_chaddr() {
+        let own = dhcp_reply_packet(VM_MAC);
+        let packet = Ipv4Packet::new_checked(own.as_slice()).unwrap();
+        assert_eq!(
+            classify_dhcp_response(&packet, GATEWAY, VM_MAC),
+            DhcpResponseDisposition::Allow
+        );
+
+        let foreign = dhcp_reply_packet(OTHER_MAC);
+        let packet = Ipv4Packet::new_checked(foreign.as_slice()).unwrap();
+        assert_eq!(
+            classify_dhcp_response(&packet, GATEWAY, VM_MAC),
+            DhcpResponseDisposition::Reject
+        );
+    }
+
+    #[test]
+    fn fragmented_traffic_from_other_sources_is_not_treated_as_dhcp() {
+        let mut bytes = ipv4_udp_packet(
+            Ipv4Address::new(192, 168, 64, 3),
+            VM_IP,
+            67,
+            68,
+            &encode_boot_reply(OTHER_MAC),
+        );
+        {
+            let mut packet = Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+            packet.set_more_frags(true);
+        }
+
+        let packet = Ipv4Packet::new_checked(bytes.as_slice()).unwrap();
+        assert_eq!(
+            classify_dhcp_response(&packet, GATEWAY, VM_MAC),
+            DhcpResponseDisposition::NotDhcp
+        );
+    }
+
+    fn dhcp_reply_packet(chaddr: [u8; 6]) -> Vec<u8> {
+        ipv4_udp_packet(GATEWAY, VM_IP, 67, 68, &encode_boot_reply(chaddr))
+    }
+
+    fn ipv4_udp_packet(
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = vec![0; 20 + 8 + payload.len()];
+        let total_len = bytes.len() as u16;
+
+        {
+            let mut ipv4 = Ipv4Packet::new_unchecked(bytes.as_mut_slice());
+            ipv4.set_version(4);
+            ipv4.set_header_len(20);
+            ipv4.set_total_len(total_len);
+            ipv4.set_next_header(IpProtocol::Udp);
+            ipv4.set_src_addr(src_addr);
+            ipv4.set_dst_addr(dst_addr);
+        }
+
+        {
+            let mut udp = UdpPacket::new_unchecked(&mut bytes[20..]);
+            udp.set_src_port(src_port);
+            udp.set_dst_port(dst_port);
+            udp.set_len((8 + payload.len()) as u16);
+        }
+
+        bytes[28..].copy_from_slice(payload);
+        bytes
     }
 }
