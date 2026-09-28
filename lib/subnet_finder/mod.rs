@@ -63,7 +63,9 @@ pub(crate) fn find_available_subnet(prefix_len: u8) -> Result<(Ipv4Addr, Ipv4Add
         }
     }
 
-    anyhow::bail!("failed to find an unused private IPv4 /{prefix_len} subnet after {MAX_ATTEMPTS} attempts")
+    anyhow::bail!(
+        "failed to find an unused private IPv4 /{prefix_len} subnet after {MAX_ATTEMPTS} attempts"
+    )
 }
 
 #[cfg(test)]
