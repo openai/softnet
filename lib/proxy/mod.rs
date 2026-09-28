@@ -2,27 +2,24 @@ mod control;
 mod exposed_port;
 mod flows;
 mod host;
-mod port_forwarder;
 mod rule;
 mod rules;
-mod udp_packet_helper;
 mod vm;
 
-use crate::dhcp_snooper::DhcpSnooper;
+use crate::dhcp_server::{DHCP_SERVER_MAC, DhcpServer};
 use crate::host::Host;
 use crate::host::NetType;
 use crate::poller::Poller;
 use crate::vm::VM;
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use control::{Control, normalize_rules};
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
-use port_forwarder::PortForwarder;
 pub use rule::{Direction, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
-use smoltcp::wire::{EthernetFrame, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
@@ -33,12 +30,11 @@ pub struct Proxy<'proxy> {
     host: Host,
     poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
-    dhcp_snooper: DhcpSnooper,
+    dhcp_server: DhcpServer,
     rules: Rules,
     control: Option<Control>,
     flows: Option<FlowTable>,
     enobufs_encountered: bool,
-    port_forwarder: PortForwarder,
 }
 
 impl Proxy<'_> {
@@ -51,12 +47,19 @@ impl Proxy<'_> {
         exposed_ports: Vec<ExposedPort>,
         control_fd: Option<RawFd>,
     ) -> Result<Proxy<'proxy>> {
+        // Ensure that VM's MAC address won't conflict with our DHCP server's MAC address
+        let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
+        if vm_mac_address == DHCP_SERVER_MAC {
+            bail!("VM MAC address {vm_mac_address} is reserved for the DHCP server");
+        }
+
         let allow = normalize_rules(allow);
         let block = normalize_rules(block);
 
         let vm = VM::new(vm_fd)?;
-        let host = Host::new(
+        let mut host = Host::new(
             vm_net_type,
+            vm_mac_address,
             !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
         )?;
         let poller_timeout = Duration::from_millis(100);
@@ -75,20 +78,34 @@ impl Proxy<'_> {
         let rules = Rules::new(host.gateway_ip, &allow, &block);
 
         // Any stateful rule enables flow inspection for the whole VM, including
-        // traffic admitted through implicit global, gateway, and DNS fallbacks
+        // traffic admitted through implicit global and gateway fallbacks
         let flows = rules.has_stateful().then(FlowTable::new);
+
+        // vmnet owns the gateway (including ARP and DNS); the VM address is
+        // reserved for this MAC for the lifetime of the attached interface.
+        let dhcp_server = DhcpServer::new(
+            vm_mac_address,
+            host.vm_ip,
+            host.subnet_mask,
+            host.gateway_ip,
+        );
+
+        // Install port forwardings for the reserved VM's IP address
+        for port in exposed_ports {
+            host.port_forwarding_add_rule(port.external_port, host.vm_ip, port.internal_port)
+                .context("failed to configure port forwarding")?;
+        }
 
         Ok(Proxy {
             vm,
             host,
             poller,
-            vm_mac_address: smoltcp::wire::EthernetAddress(vm_mac_address.bytes()),
-            dhcp_snooper: DhcpSnooper::new(poller_timeout, vm_mac_address.bytes()),
+            vm_mac_address,
+            dhcp_server,
             rules,
             control,
             flows,
             enobufs_encountered: false,
-            port_forwarder: PortForwarder::new(exposed_ports),
         })
     }
 
@@ -108,7 +125,7 @@ impl Proxy<'_> {
         loop {
             let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
 
-            // Update coarse time for DHCP snooping and flows
+            // Update coarse time for flows
             coarsetime::Instant::update();
 
             // Service control on every wake (including timeouts) so a bounded read or a pending
@@ -134,9 +151,6 @@ impl Proxy<'_> {
                 if !self.vm.is_connected()? {
                     return Ok(());
                 }
-
-                self.port_forwarder
-                    .tick(&mut self.host, self.dhcp_snooper.lease());
             }
 
             self.poller.rearm();
@@ -149,7 +163,7 @@ impl Proxy<'_> {
         loop {
             match self.vm.read(buf) {
                 Ok(n) => {
-                    // Update coarse time for DHCP snooping and flows
+                    // Update coarse time for flows
                     coarsetime::Instant::update();
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
@@ -177,7 +191,7 @@ impl Proxy<'_> {
         loop {
             match self.host.read(batch, bufs) {
                 Ok(pktcnt) => {
-                    // Update coarse time for DHCP snooping and flows
+                    // Update coarse time for flows
                     coarsetime::Instant::update();
 
                     for buf in batch.packet_sized_bufs(bufs).take(pktcnt) {
@@ -263,22 +277,19 @@ impl Proxy<'_> {
 #[cfg(test)]
 mod tests {
     use crate::NetType;
-    use crate::dhcp_snooper::Lease;
     use crate::proxy::Proxy;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use serial_test::serial;
     use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
-    use std::collections::HashSet;
     use std::os::fd::AsRawFd;
     use std::str::FromStr;
-    use std::time::Duration;
 
     #[test]
     #[serial]
     fn test_blocking_takes_precedence() {
-        let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let mut proxy = create_proxy(vm_ip, vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
+        let mut proxy = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
+        let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 1);
 
@@ -288,8 +299,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_longest_prefix_match_wins() {
-        let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let mut proxy = create_proxy(vm_ip, vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
+        let mut proxy = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
+        let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
 
@@ -301,8 +312,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_allow_host() {
-        let vm_ip = Ipv4Address::from_str("192.168.0.2").unwrap();
-        let mut proxy = create_proxy(vm_ip, vec!["@host"], vec!["0.0.0.0/0"]);
+        let mut proxy = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
+        let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
 
@@ -317,10 +328,10 @@ mod tests {
     #[test]
     #[serial]
     fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
-        let vm_ip = Ipv4Address::new(192, 168, 0, 2);
+        let mut proxy = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
+        let vm_ip = proxy.host.vm_ip;
         let fallback_peer = Ipv4Address::new(203, 0, 113, 1);
         let explicitly_allowed_peer = Ipv4Address::new(192, 0, 2, 1);
-        let mut proxy = create_proxy(vm_ip, vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
 
         let fallback_request = udp_packet(fallback_peer, 40_000, vm_ip, 1_234);
         let fallback_request = Ipv4Packet::new_checked(fallback_request.as_slice()).unwrap();
@@ -342,9 +353,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
-        let vm_ip = Ipv4Address::new(192, 168, 0, 2);
+        let mut proxy = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
+        let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
-        let mut proxy = create_proxy(vm_ip, vec![], vec!["out 203.0.113.0/24"]);
 
         let request = udp_packet(peer, 40_000, vm_ip, 1_234);
         let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
@@ -358,9 +369,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
-        let vm_ip = Ipv4Address::new(192, 168, 0, 2);
+        let mut proxy = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
+        let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
-        let mut proxy = create_proxy(vm_ip, vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
 
         let request = udp_packet(vm_ip, 1_234, peer, 40_000);
         let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
@@ -371,7 +382,7 @@ mod tests {
         assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
     }
 
-    fn create_proxy<'test>(vm_ip: Ipv4Address, allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {
+    fn create_proxy<'test>(allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {
         let (vm_fd, _) = socketpair(
             AddressFamily::Unix,
             SockType::Datagram,
@@ -381,9 +392,9 @@ mod tests {
         .unwrap();
         let vm_fd = Box::leak(Box::new(vm_fd));
 
-        let mut proxy = Proxy::new(
+        Proxy::new(
             vm_fd.as_raw_fd(),
-            MacAddress::from_str("02:00:00:00:00:01").unwrap(),
+            MacAddress::from_str("02:00:00:00:00:02").unwrap(),
             NetType::Nat,
             allow
                 .into_iter()
@@ -396,15 +407,7 @@ mod tests {
             Vec::default(),
             None,
         )
-        .unwrap();
-
-        proxy.dhcp_snooper.set_lease(Some(Lease::new(
-            vm_ip,
-            Duration::from_secs(600),
-            HashSet::new(),
-        )));
-
-        proxy
+        .unwrap()
     }
 
     fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {

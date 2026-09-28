@@ -152,10 +152,6 @@ impl FlowTable {
         true
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.flows.clear();
-    }
-
     fn sweep_if_due(&mut self, now: Instant) {
         if now < self.next_sweep {
             return;

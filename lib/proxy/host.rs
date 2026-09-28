@@ -1,19 +1,9 @@
-use crate::dhcp_snooper::message_matches_bootp_client;
 use crate::proxy::flows::{FlowDirection, FlowMatch};
-use crate::proxy::udp_packet_helper::UdpPacketHelper;
 use crate::proxy::{Direction, PolicyDecision, Proxy};
 use anyhow::{Context, Result};
-use dhcproto::Decodable;
-use dhcproto::v4::Opcode;
+use dhcproto::v4::{CLIENT_PORT, SERVER_PORT};
 use smoltcp::phy::ChecksumCapabilities;
-use smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
-
-/// DhcpResponseDisposition distinguishes non-DHCP traffic from allowed and rejected DHCP replies.
-enum DhcpResponseDisposition {
-    NotDhcp,
-    Allow,
-    Reject,
-}
+use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
 
 impl Proxy<'_> {
     pub(crate) fn process_frame_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Result<()> {
@@ -22,13 +12,11 @@ impl Proxy<'_> {
             return Ok(());
         }
 
-        // Snoop bootpd(8) replies from the host to
-        // figure out the IP assigned to the VM
-        if frame.dst_addr() == self.vm_mac_address || frame.dst_addr().is_broadcast() {
-            self.snoop(frame);
-        }
+        self.write_to_vm(frame.as_ref())
+    }
 
-        match self.vm.write(frame.as_ref()) {
+    pub(super) fn write_to_vm(&mut self, packet: &[u8]) -> Result<()> {
+        match self.vm.write(packet) {
             Ok(_) => Ok(()),
             Err(err) => {
                 if let Some(libc::ENOBUFS) = err.raw_os_error() {
@@ -62,10 +50,15 @@ impl Proxy<'_> {
     }
 
     pub(super) fn allowed_from_host_ipv4(&mut self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> Option<()> {
-        match self.dhcp_response_disposition(ipv4_pkt) {
-            DhcpResponseDisposition::NotDhcp => { /* Fall through to generic policy */ }
-            DhcpResponseDisposition::Allow => return Some(()),
-            DhcpResponseDisposition::Reject => return None,
+        // Drop external DHCP replies, including malformed and fragmented replies
+        if ipv4_pkt.next_header() == IpProtocol::Udp
+            && ipv4_pkt.frag_offset() == 0
+            && ipv4_pkt.payload().len() >= 4
+        {
+            let udp = UdpPacket::new_unchecked(ipv4_pkt.payload());
+            if udp.src_port() == SERVER_PORT && udp.dst_port() == CLIENT_PORT {
+                return None;
+            }
         }
 
         // Backwards compatibility with Softnet consumers that only use stateless rules
@@ -75,12 +68,7 @@ impl Proxy<'_> {
 
         // Consult the flow table before evaluating inbound policy
         // so established flows are not treated as new traffic
-        let pending = if self
-            .dhcp_snooper
-            .lease()
-            .as_ref()
-            .is_some_and(|lease| lease.is_valid_for(ipv4_pkt.dst_addr()))
-        {
+        let pending = if self.host.vm_ip == ipv4_pkt.dst_addr() {
             match self
                 .flows
                 .as_mut()?
@@ -115,117 +103,5 @@ impl Proxy<'_> {
                 self.admit_with_tracking_if_stateful(pending, ipv4_pkt.src_addr(), Direction::Out)
             }
         }
-    }
-
-    fn snoop(&mut self, frame: &EthernetFrame<&[u8]>) {
-        if frame.ethertype() != EthernetProtocol::Ipv4 {
-            return;
-        }
-
-        let ipv4_pkt = match Ipv4Packet::new_checked(frame.payload()) {
-            Ok(ipv4_pkt) => ipv4_pkt,
-            _ => return,
-        };
-
-        match self.dhcp_response_disposition(&ipv4_pkt) {
-            DhcpResponseDisposition::Allow => { /* Continue snooping */ }
-            DhcpResponseDisposition::NotDhcp | DhcpResponseDisposition::Reject => return,
-        }
-
-        let udp_pkt = match UdpPacket::new_checked(ipv4_pkt.payload()) {
-            Ok(udp_pkt) => udp_pkt,
-            Err(_) => return,
-        };
-
-        let address_and_dns_ips_saved = self.dhcp_snooper.address_and_dns_ips();
-        self.dhcp_snooper.register_dhcp_reply(udp_pkt.payload());
-        if address_and_dns_ips_saved != self.dhcp_snooper.address_and_dns_ips()
-            && let Some(flows) = &mut self.flows
-        {
-            flows.clear();
-        }
-    }
-
-    fn dhcp_response_disposition(&self, ipv4_pkt: &Ipv4Packet<&[u8]>) -> DhcpResponseDisposition {
-        if ipv4_pkt.src_addr() != self.host.gateway_ip
-            || ipv4_pkt.next_header() != smoltcp::wire::IpProtocol::Udp
-        {
-            return DhcpResponseDisposition::NotDhcp;
-        }
-
-        let Ok(udp_pkt) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
-            return DhcpResponseDisposition::NotDhcp;
-        };
-
-        // Require the standard DHCP server and client ports
-        if !udp_pkt.is_dhcp_response() {
-            return DhcpResponseDisposition::NotDhcp;
-        }
-
-        // Require the BOOTP client hardware address to match this VM
-        // (symmetric with is_allowed_dhcp_request / #191 on the VM→host path)
-        let mut decoder = dhcproto::v4::Decoder::new(udp_pkt.payload());
-        let Ok(message) = dhcproto::v4::Message::decode(&mut decoder) else {
-            return DhcpResponseDisposition::Reject;
-        };
-
-        if message_matches_bootp_client(&message, Opcode::BootReply, self.vm_mac_address.0) {
-            DhcpResponseDisposition::Allow
-        } else {
-            DhcpResponseDisposition::Reject
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::dhcp_snooper::message_matches_bootp_client;
-    use dhcproto::Decodable;
-    use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
-    use dhcproto::{Encodable, Encoder};
-    use smoltcp::wire::Ipv4Address;
-
-    const VM_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-    const OTHER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
-
-    #[test]
-    fn dhcp_boot_reply_chaddr_must_match_vm() {
-        let own = encode_boot_reply(VM_MAC);
-        let foreign = encode_boot_reply(OTHER_MAC);
-
-        let mut dec = dhcproto::v4::Decoder::new(&own);
-        let own_msg = Message::decode(&mut dec).unwrap();
-        let mut dec = dhcproto::v4::Decoder::new(&foreign);
-        let foreign_msg = Message::decode(&mut dec).unwrap();
-
-        assert!(message_matches_bootp_client(
-            &own_msg,
-            Opcode::BootReply,
-            VM_MAC
-        ));
-        assert!(!message_matches_bootp_client(
-            &foreign_msg,
-            Opcode::BootReply,
-            VM_MAC
-        ));
-    }
-
-    fn encode_boot_reply(chaddr: [u8; 6]) -> Vec<u8> {
-        let mut message = Message::new(
-            Ipv4Address::UNSPECIFIED,
-            Ipv4Address::new(192, 168, 64, 2),
-            Ipv4Address::UNSPECIFIED,
-            Ipv4Address::UNSPECIFIED,
-            &chaddr,
-        );
-        message.set_opcode(Opcode::BootReply);
-        message
-            .opts_mut()
-            .insert(DhcpOption::MessageType(MessageType::Ack));
-        message.opts_mut().insert(DhcpOption::AddressLeaseTime(600));
-
-        let mut encoded = Vec::new();
-        message.encode(&mut Encoder::new(&mut encoded)).unwrap();
-        encoded
     }
 }

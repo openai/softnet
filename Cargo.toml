@@ -16,7 +16,7 @@ smoltcp = "0"
 libc = "0"
 polling = "3"
 dhcproto = { git = "https://github.com/bluecatengineering/dhcproto.git", branch = "master" }
-vmnet = "0.5.1"
+vmnet = "0.7.0"
 clap = { version = "4", features = ["derive"] }
 mac_address = "1"
 privdrop = "0"
@@ -28,8 +28,10 @@ num_enum = "0"
 sentry = { version = "0", features = ["debug-images"] }
 sentry-anyhow = { version = "0", features = ["backtrace"] }
 nix = { version = "0", features = ["signal", "socket"] }
+network-interface = "2"
 prefix-trie = "0"
 ipnet = "2"
+rand = "0.10"
 oslog = "0.2.0"
 log = "0.4.29"
 serial_test = "4"

@@ -38,5 +38,5 @@ brews:
     skip_upload: auto
     custom_block: |
       on_macos do
-        depends_on :macos => :sequoia
+        depends_on :macos => :tahoe
       end

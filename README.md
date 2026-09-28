@@ -23,12 +23,7 @@ Softnet solves two problems:
 2. DHCP exhaustion
     * macOS built-in DHCP-server allocates a `/24` subnet with 86400 seconds lease time by default, which only allows for ~253 VMs a day (or 1 VM every ~6 minutes) to be spawned without causing a denial-of-service, which is pretty limiting for CI services like Cirrus CI
 
-And assumes that:
-
-1. Tart gives it's VMs unique MAC-addresses
-2. macOS built-in DHCP-server won't re-use the IP-addresses from it's pool until their lease expire
-
-...otherwise it's possible for two VMs to receive an identical IP-address from the macOS built-in DHCP-server (even in the presence of Softnet's packet filtering) and thus bypass the protections offered by Softnet.
+Each VM gets a separate [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/30` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for the VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
 
 ### Stateful flow authorization
 
@@ -58,6 +53,8 @@ policy did not permit.
 For ICMP, stateful flow authorization supports only echo requests and replies.
 
 ## Installing
+
+Softnet requires macOS 26 or newer; building also requires the macOS 26 SDK or newer.
 
 For proper functioning, Softnet binary requires two things:
 

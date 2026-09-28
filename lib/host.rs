@@ -1,15 +1,16 @@
+use crate::subnet_finder;
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 use log::info;
+use smoltcp::wire::EthernetAddress;
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
-use std::str::FromStr;
 use std::sync::mpsc::{SyncSender, sync_channel};
-use vmnet::mode::Mode;
+use vmnet::network::Mode;
 use vmnet::parameters::{Parameter, ParameterKind};
 use vmnet::port_forwarding::{AddressFamily, Protocol};
-use vmnet::{Batch, Events, Options};
+use vmnet::{Batch, Events, Network, NetworkConfiguration, Options};
 
 #[derive(ValueEnum, Clone, Debug)]
 pub enum NetType {
@@ -27,6 +28,8 @@ pub struct Host {
     interface: vmnet::Interface,
     new_packets_rx: UnixDatagram,
     callback_can_continue_tx: SyncSender<()>,
+    pub vm_ip: Ipv4Addr,
+    pub subnet_mask: Ipv4Addr,
     pub gateway_ip: smoltcp::wire::Ipv4Address,
     pub max_packet_size: u64,
     pub read_max_packets: u64,
@@ -34,30 +37,48 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new(vm_net_type: NetType, enable_isolation: bool) -> Result<Host> {
-        // Initialize a vmnet.framework NAT or Host interface with isolation enabled
-        let mut interface = vmnet::Interface::new(
-            match vm_net_type {
-                NetType::Nat => Mode::Shared(Default::default()),
-                NetType::Host => Mode::Host(Default::default()),
-            },
+    pub fn new(
+        vm_net_type: NetType,
+        vm_mac: EthernetAddress,
+        enable_isolation: bool,
+    ) -> Result<Host> {
+        // Find an unused /30 subnet for the gateway and VM
+        let (gateway_ip, vm_ip, subnet) = subnet_finder::find_available_subnet(30)?;
+
+        // Create vmnet's network configuration
+        let mut configuration = NetworkConfiguration::new(match vm_net_type {
+            NetType::Nat => Mode::Shared,
+            NetType::Host => Mode::Host,
+        })
+        .context("failed to create vmnet network configuration")?;
+
+        // Configure the gateway address and subnet mask
+        let subnet_mask = subnet.netmask();
+        configuration
+            .set_ipv4_subnet(gateway_ip, subnet_mask)
+            .context("failed to configure IPv4 subnet")?;
+
+        // Reserve the VM's address for its MAC
+        configuration
+            .add_dhcp_reservation(vm_mac.0, vm_ip)
+            .context("failed to add DHCP address reservation")?;
+
+        // Create vmnet's network
+        let network = Network::new(&configuration)
+            .with_context(|| format!("failed to create vmnet network {subnet}"))?;
+
+        // Instantiate vmnet's interface
+        //
+        // The interface retains the network reservation until it is stopped
+        let mut interface = vmnet::Interface::with_network(
+            &network,
             Options {
+                allocate_mac_address: Some(false),
                 enable_isolation: Some(enable_isolation),
                 ..Default::default()
             },
         )
         .context("failed to initialize vmnet interface")?;
-
-        // Retrieve first IP (gateway) used for this interface
-        let Some(Parameter::StartAddress(gateway_ip)) =
-            interface.parameters().get(ParameterKind::StartAddress)
-        else {
-            return Err(anyhow!(
-                "failed to retrieve vmnet's interface start address"
-            ));
-        };
-        let gateway_ip = Ipv4Addr::from_str(&gateway_ip)
-            .context("failed to parse vmnet's interface start address")?;
 
         // Retrieve max packet size for this interface
         let Some(Parameter::MaxPacketSize(max_packet_size)) =
@@ -104,6 +125,8 @@ impl Host {
             interface,
             new_packets_rx,
             callback_can_continue_tx,
+            vm_ip,
+            subnet_mask,
             gateway_ip,
             max_packet_size,
             read_max_packets,
@@ -133,15 +156,6 @@ impl Host {
             )
             .map(|_| info!("added port forwarding rule {details}"))
             .map_err(|err| anyhow!("failed to add port forwarding rule {details}: {err}"))
-    }
-
-    pub fn port_forwarding_remove_rule(&mut self, external_port: u16) -> Result<()> {
-        let details = format!("external_port={external_port}");
-
-        self.interface
-            .port_forwarding_rule_remove(AddressFamily::Ipv4, Protocol::Tcp, external_port)
-            .map(|_| info!("removed port forwarding rule {details}"))
-            .map_err(|err| anyhow!("failed to remove port forwarding rule {details}: {err}"))
     }
 
     pub fn read(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> vmnet::Result<usize> {
