@@ -23,7 +23,7 @@ Softnet solves two problems:
 2. DHCP exhaustion
     * macOS built-in DHCP-server allocates a `/24` subnet with 86400 seconds lease time by default, which only allows for ~253 VMs a day (or 1 VM every ~6 minutes) to be spawned without causing a denial-of-service, which is pretty limiting for CI services like Cirrus CI
 
-Each VM gets a separate [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/30` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for the VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
+Each VM gets a separate [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/29` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for the VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
 
 ### Stateful flow authorization
 

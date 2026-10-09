@@ -76,11 +76,11 @@ mod tests {
     #[serial_test::serial]
     fn finds_two_usable_addresses() {
         // Find a subnet on the current host
-        let (gateway_ip, vm_ip, subnet) = find_available_subnet(30).unwrap();
+        let (gateway_ip, vm_ip, subnet) = find_available_subnet(29).unwrap();
 
-        // Check the subnet and its two usable addresses
-        assert_eq!(subnet.prefix_len(), 30);
+        // Check the subnet and its first two usable addresses
+        assert_eq!(subnet.prefix_len(), 29);
         assert!(subnet.network().is_private());
-        assert_eq!(subnet.hosts().collect::<Vec<_>>(), [gateway_ip, vm_ip]);
+        assert_eq!(subnet.hosts().collect::<Vec<_>>()[..2], [gateway_ip, vm_ip]);
     }
 }

@@ -42,8 +42,8 @@ impl Host {
         vm_mac: EthernetAddress,
         enable_isolation: bool,
     ) -> Result<Host> {
-        // Find an unused /30 subnet for the gateway and VM
-        let (gateway_ip, vm_ip, subnet) = subnet_finder::find_available_subnet(30)?;
+        // Find an unused /29 subnet for the gateway and VM
+        let (gateway_ip, vm_ip, subnet) = subnet_finder::find_available_subnet(29)?;
 
         // Create vmnet's network configuration
         let mut configuration = NetworkConfiguration::new(match vm_net_type {
