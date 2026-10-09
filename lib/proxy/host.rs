@@ -1,5 +1,5 @@
 use crate::proxy::flows::{FlowDirection, FlowMatch};
-use crate::proxy::{Direction, PolicyDecision, Proxy};
+use crate::proxy::{Direction, PolicyDecision, Proxy, transport_ports};
 use anyhow::{Context, Result};
 use dhcproto::v4::{CLIENT_PORT, SERVER_PORT};
 use smoltcp::phy::ChecksumCapabilities;
@@ -84,9 +84,11 @@ impl Proxy<'_> {
         };
 
         // The flow is either pending or untracked, evaluate it against inbound policy
+        let src_port = transport_ports(ipv4_pkt).map(|(src_port, _)| src_port);
+
         match self
             .rules
-            .policy_decision(ipv4_pkt.src_addr(), Direction::In)
+            .policy_decision(ipv4_pkt.src_addr(), src_port, Direction::In)
         {
             // Return traffic was handled above; enforce explicit inbound blocks here
             Some(PolicyDecision::Block) => None,
@@ -99,9 +101,12 @@ impl Proxy<'_> {
 
             // No inbound rule matched, so allow by default. Track the flow when needed
             // so its reply is not treated as a new outbound flow
-            None => {
-                self.admit_with_tracking_if_stateful(pending, ipv4_pkt.src_addr(), Direction::Out)
-            }
+            None => self.admit_with_tracking_if_stateful(
+                pending,
+                ipv4_pkt.src_addr(),
+                src_port,
+                Direction::Out,
+            ),
         }
     }
 }

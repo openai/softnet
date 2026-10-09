@@ -17,9 +17,9 @@ pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
-pub use rule::{Direction, Rule, Target};
+pub use rule::{Direction, Ports, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
-use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, EthernetFrame, IpProtocol, Ipv4Address, Ipv4Packet};
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
@@ -60,7 +60,7 @@ impl Proxy<'_> {
         let mut host = Host::new(
             vm_net_type,
             vm_mac_address,
-            !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
+            !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()), None)),
         )?;
         let poller_timeout = Duration::from_millis(100);
         let control = control_fd
@@ -264,9 +264,13 @@ impl Proxy<'_> {
         &mut self,
         pending: Option<PendingFlow>,
         peer_addr: Ipv4Address,
+        peer_port: Option<u16>,
         return_direction: Direction,
     ) -> Option<()> {
-        if self.rules.is_stateful(peer_addr, return_direction) {
+        if self
+            .rules
+            .is_stateful(peer_addr, peer_port, return_direction)
+        {
             self.admit_with_tracking_if_trackable(pending)
         } else {
             Some(())
@@ -274,10 +278,28 @@ impl Proxy<'_> {
     }
 }
 
+/// Returns the TCP or UDP source and destination ports, which only the first fragment carries.
+pub(crate) fn transport_ports(ipv4_pkt: &Ipv4Packet<&[u8]>) -> Option<(u16, u16)> {
+    if !matches!(ipv4_pkt.next_header(), IpProtocol::Tcp | IpProtocol::Udp)
+        || ipv4_pkt.frag_offset() != 0
+    {
+        return None;
+    }
+
+    // TCP and UDP both begin with the source port, then the destination port
+    match ipv4_pkt.payload() {
+        [src_hi, src_lo, dst_hi, dst_lo, ..] => Some((
+            u16::from_be_bytes([*src_hi, *src_lo]),
+            u16::from_be_bytes([*dst_hi, *dst_lo]),
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::NetType;
-    use crate::proxy::Proxy;
+    use crate::proxy::{Proxy, transport_ports};
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use serial_test::serial;
@@ -380,6 +402,31 @@ mod tests {
         let reply = udp_packet(peer, 40_000, vm_ip, 1_234);
         let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
         assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
+    }
+
+    #[test]
+    fn test_transport_ports_only_in_first_fragment() {
+        let src = Ipv4Address::new(10, 0, 0, 2);
+        let dst = Ipv4Address::new(192, 168, 0, 10);
+        let mut bytes = udp_packet(src, 50000, dst, 8444);
+
+        assert_eq!(
+            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
+            Some((50000, 8444))
+        );
+
+        Ipv4Packet::new_unchecked(bytes.as_mut_slice()).set_frag_offset(8);
+        assert_eq!(
+            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
+            None
+        );
+
+        let mut bytes = udp_packet(src, 50000, dst, 8444);
+        Ipv4Packet::new_unchecked(bytes.as_mut_slice()).set_next_header(IpProtocol::Icmp);
+        assert_eq!(
+            transport_ports(&Ipv4Packet::new_unchecked(bytes.as_slice())),
+            None
+        );
     }
 
     fn create_proxy<'test>(allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {

@@ -106,7 +106,7 @@ fn parse_rules(rules: Vec<String>) -> std::result::Result<Vec<Rule>, ErrorObject
         let parsed_rule = rule.parse().map_err(|_| {
             rpc_error(
                 INVALID_PARAMS,
-                format!("invalid rule {rule:?}: expected TARGET, \"in TARGET\", or \"out TARGET\""),
+                format!("invalid rule {rule:?}: expected TARGET[:PORTS], \"in TARGET[:PORTS]\", or \"out TARGET[:PORTS]\""),
             )
         })?;
         parsed.push(parsed_rule);
@@ -645,13 +645,13 @@ mod tests {
         assert_eq!(
             policy
                 .rules
-                .policy_decision(Ipv4Address::new(10, 0, 0, 1), Direction::Out),
+                .policy_decision(Ipv4Address::new(10, 0, 0, 1), None, Direction::Out),
             Some(PolicyDecision::Block)
         );
         assert_eq!(
             policy
                 .rules
-                .policy_decision(Ipv4Address::new(192, 168, 64, 1), Direction::Out),
+                .policy_decision(Ipv4Address::new(192, 168, 64, 1), None, Direction::Out),
             Some(PolicyDecision::Block)
         );
     }
@@ -707,11 +707,11 @@ mod tests {
         assert_eq!(response["result"]["ruleCount"], 2);
         let target = Ipv4Address::new(10, 1, 2, 3);
         assert_eq!(
-            policy.rules.policy_decision(target, Direction::In),
+            policy.rules.policy_decision(target, None, Direction::In),
             Some(PolicyDecision::Block)
         );
         assert_eq!(
-            policy.rules.policy_decision(target, Direction::Out),
+            policy.rules.policy_decision(target, None, Direction::Out),
             Some(PolicyDecision::AllowStateful)
         );
     }
