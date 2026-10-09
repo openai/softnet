@@ -8,13 +8,19 @@ const MAX_ATTEMPTS: usize = 128;
 
 /// Find an available private subnet and its first two usable host addresses
 pub(crate) fn find_available_subnet(prefix_len: u8) -> Result<(Ipv4Addr, Ipv4Addr, Ipv4Net)> {
-    // Add private address space (as defined in RFC 1918[1])
+    // Add private address space (as defined in RFC 1918[1]) with one exception
+    //
+    // We narrow the 192.168.0.0/16 allocation pool to work around a macOS bug
+    // where long subnet address strings lose their CIDR prefix in the generated
+    // firewall rules, causing connection issues.
     //
     // [1]: https://datatracker.ietf.org/doc/html/rfc1918#section-3
     let private_subnets: Vec<Ipv4Net> = vec![
         "10.0.0.0/8".parse()?,
         "172.16.0.0/12".parse()?,
-        "192.168.0.0/16".parse()?,
+        "192.168.0.0/18".parse()?,  // third octet 0–63
+        "192.168.64.0/19".parse()?, // third octet 64–95
+        "192.168.96.0/22".parse()?, // third octet 96–99
     ];
 
     // Figure out which address space is already utilized on the host
