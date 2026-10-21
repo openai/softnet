@@ -75,6 +75,9 @@ struct Args {
         Targets are:\n\n\
         * IPv4 CIDRs\n\
         * @host, which matches the vmnet bridge gateway IP\n\n\
+        A target may end in :PORT or :FIRST-LAST to match only TCP and UDP traffic with \
+        that port on the target's side. A rule with ports takes precedence over any rule \
+        without them.\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
         When used with --block, the longest prefix match wins. If an identical rule is both \
         allowed and blocked, blocking takes precedence.\n\n\
@@ -84,6 +87,7 @@ struct Args {
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
         * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
         * --allow=\"out 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
+        * --allow=192.168.0.10/32:8443 — allow stateless traffic with one port of this LAN host\n\
         * --allow=\"in @host,out 192.168.0.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
@@ -100,6 +104,9 @@ struct Args {
         Targets are:\n\n\
         * IPv4 CIDRs\n\
         * @host, which matches the vmnet bridge gateway IP\n\n\
+        A target may end in :PORT or :FIRST-LAST to match only TCP and UDP traffic with \
+        that port on the target's side. A rule with ports takes precedence over any rule \
+        without them.\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
         When used with --allow, the longest prefix match wins. If an identical rule is both \
         allowed and blocked, blocking takes precedence.\n\n\
@@ -107,6 +114,7 @@ struct Args {
         * --block=0.0.0.0/0 — establish a stateless default-deny egress policy\n\
         * --block=\"out @host\" — block stateful flows initiated toward @host\n\
         * --block=\"out 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
+        * --block=@host:22 — block stateless traffic to SSH on @host\n\
         * --block=\"out @host,out 66.66.66.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,

@@ -1,5 +1,5 @@
 use crate::proxy::flows::{FlowDirection, FlowMatch};
-use crate::proxy::{Direction, PolicyDecision, Proxy};
+use crate::proxy::{Direction, PolicyDecision, Proxy, transport_ports};
 use anyhow::Context;
 use anyhow::Result;
 use dhcproto::v4::SERVER_PORT;
@@ -77,15 +77,24 @@ impl Proxy<'_> {
 
             // The flow is either pending or untracked, evaluate it against outbound policy
             let dst_addr = ipv4_pkt.dst_addr();
+            let dst_port = transport_ports(&ipv4_pkt).map(|(_, dst_port)| dst_port);
 
-            match self.rules.policy_decision(dst_addr, Direction::Out) {
+            match self
+                .rules
+                .policy_decision(dst_addr, dst_port, Direction::Out)
+            {
                 // Return traffic was handled above; enforce explicit outbound blocks here
                 Some(PolicyDecision::Block) => return None,
 
                 // Track statelessly allowed traffic only when needed so its reply is not
                 // treated as a new inbound flow
                 Some(PolicyDecision::AllowStateless) => {
-                    return self.admit_with_tracking_if_stateful(pending, dst_addr, Direction::In);
+                    return self.admit_with_tracking_if_stateful(
+                        pending,
+                        dst_addr,
+                        dst_port,
+                        Direction::In,
+                    );
                 }
 
                 // Untracked packets cannot satisfy stateful policy
