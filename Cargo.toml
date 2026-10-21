@@ -14,7 +14,10 @@ debug = true
 [dependencies]
 smoltcp = "0"
 libc = "0"
-polling = "3"
+tokio = { version = "1", features = ["rt", "sync", "net", "signal", "time", "macros", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 dhcproto = { git = "https://github.com/bluecatengineering/dhcproto.git", branch = "master" }
 vmnet = "0.7.0"
 clap = { version = "4", features = ["derive"] }
@@ -24,10 +27,9 @@ anyhow = { version = "1", features = ["backtrace"] }
 ip_network = "0"
 uzers = "0"
 system-configuration = "0"
-num_enum = "0"
 sentry = { version = "0", features = ["debug-images"] }
 sentry-anyhow = { version = "0", features = ["backtrace"] }
-nix = { version = "0", features = ["signal", "socket"] }
+nix = { version = "0", features = ["socket"] }
 network-interface = "2"
 prefix-trie = "0"
 ipnet = "2"

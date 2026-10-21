@@ -1,7 +1,6 @@
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use log::LevelFilter;
-use nix::sys::signal::{SigHandler, Signal, signal};
 use oslog::OsLogger;
 use privdrop::PrivDrop;
 use softnet::NetType;
@@ -23,6 +22,7 @@ use system_configuration::sys::preferences::{
     SCPreferencesApplyChanges, SCPreferencesCommitChanges, SCPreferencesLock,
     SCPreferencesSetValue, SCPreferencesUnlock,
 };
+use tokio::signal::unix::{SignalKind, signal};
 use uzers::{get_current_groupname, get_current_username, get_effective_uid};
 
 const VERSION: &str = match option_env!("SOFTNET_VERSION") {
@@ -168,19 +168,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn try_main() -> anyhow::Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn try_main() -> anyhow::Result<()> {
     // Initialize logger
     OsLogger::new("org.cirruslabs.softnet")
         .level_filter(LevelFilter::Info)
         .init()?;
-
-    // The default signal(3)[1] action for SIGINT is to interrupt program,
-    // but we want to handle SIGINT ourselves, so we ignore it. The kqueue(2)'s[2]
-    // EVFILT_SIGNAL will receive it anyways, because it has lower precedence.
-    //
-    // [1]: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/signal.3.html
-    // [2]: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html
-    unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) }?;
 
     let args: Args = Args::parse();
 
@@ -248,8 +241,13 @@ fn try_main() -> anyhow::Result<()> {
         .apply()
         .context("failed to drop privileges")?;
 
-    // Run proxy
-    proxy.run()
+    // Run the proxy until it finishes or the process receives SIGINT
+    let mut interrupt = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        result = proxy.run() => result,
+        _ = interrupt.recv() => Ok(()),
+    }
 }
 
 fn parse_vm_fd(value: &str) -> Result<c_int, String> {

@@ -1,5 +1,7 @@
 use super::{Rule, Rules};
 use anyhow::{Context, Result, bail};
+use bytes::BytesMut;
+use futures_util::{SinkExt, StreamExt};
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request, Response, ResponsePayload,
     error::{
@@ -7,20 +9,21 @@ use jsonrpsee_types::{
         METHOD_NOT_FOUND_CODE as METHOD_NOT_FOUND, PARSE_ERROR_CODE as PARSE_ERROR,
     },
 };
+use nix::sys::socket::{Shutdown, shutdown};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use smoltcp::wire::Ipv4Address;
-use std::io::{self, ErrorKind, Read, Write};
+use std::future::poll_fn;
+use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use tokio_util::codec::{Decoder, Encoder, Framed, LinesCodec, LinesCodecError};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_RESPONSE_BYTES: usize = 4 * MAX_REQUEST_BYTES;
 const MAX_RULES: usize = 4096;
 const MAX_IDENTIFIER_BYTES: usize = 256;
-const MAX_SERVICE_BYTES: usize = MAX_REQUEST_BYTES;
 
 pub(super) struct Policy {
     allow: Vec<Rule>,
@@ -124,13 +127,7 @@ pub(super) fn normalize_rules(mut rules: Vec<Rule>) -> Vec<Rule> {
 
 pub(super) struct Control {
     policy: Policy,
-    stream: UnixStream,
-    input: Vec<u8>,
-    output: Vec<u8>,
-    output_offset: usize,
-    discarding_input: bool,
-    input_closed: bool,
-    policy_changed: bool,
+    stream: Framed<tokio::net::UnixStream, ControlCodec>,
 }
 
 impl Control {
@@ -148,199 +145,118 @@ impl Control {
 
         Ok(Control {
             policy: Policy::new(gateway_ip, allow, block),
-            stream,
-            input: Vec::new(),
-            output: Vec::new(),
-            output_offset: 0,
-            discarding_input: false,
-            input_closed: false,
-            policy_changed: false,
+            stream: Framed::new(
+                tokio::net::UnixStream::from_std(stream)?,
+                ControlCodec(LinesCodec::new_with_max_length(MAX_REQUEST_BYTES)),
+            ),
         })
     }
 
-    pub(super) fn service(&mut self, rules: &mut Rules) -> Result<bool> {
-        if !self.flush()? {
-            return Ok(false);
-        }
+    /// Cancellation only interrupts buffered I/O; policy changes finish in the same poll.
+    /// Returns None on EOF, or whether the completed request changed the policy.
+    pub(super) async fn service(&mut self, rules: &mut Rules) -> Result<Option<bool>> {
+        // Flush pending responses before reading; Framed retains partial I/O across cancellation
+        self.stream.flush().await?;
+        poll_fn(|cx| self.stream.poll_ready_unpin(cx)).await?;
 
-        if !self.output.is_empty() {
-            return Ok(true);
-        }
+        let Some(frame) = self.stream.next().await.transpose()? else {
+            return Ok(None);
+        };
 
-        if !self.process_input(rules)? {
-            return Ok(false);
-        }
-
-        if !self.output.is_empty() {
-            return Ok(true);
-        }
-
-        if self.input_closed {
-            return Ok(false);
-        }
-
-        let mut buf = [0; 8192];
-        let mut bytes_read = 0;
-
-        while bytes_read < MAX_SERVICE_BYTES {
-            match self.stream.read(&mut buf) {
-                Ok(0) => {
-                    self.input_closed = true;
-                    break;
-                }
-                Ok(n) => {
-                    bytes_read += n;
-                    self.input.extend_from_slice(&buf[..n]);
-                    if !self.process_input(rules)? {
-                        return Ok(false);
-                    }
-
-                    if !self.output.is_empty() {
-                        return Ok(true);
-                    }
-                }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    return Ok(false);
-                }
-                Err(err) => return Err(err).context("failed to read the control socket"),
-            }
-        }
-
-        Ok(!self.input_closed)
+        self.respond(frame, rules).map(Some)
     }
 
-    pub(super) fn shutdown(&self) -> Result<()> {
-        self.stream
-            .shutdown(Shutdown::Both)
-            .context("failed to shut down the control socket")
-    }
-
-    /// Returns whether the policy changed and clears the change flag.
-    pub(super) fn policy_changed(&mut self) -> bool {
-        std::mem::take(&mut self.policy_changed)
-    }
-
-    fn process_input(&mut self, rules: &mut Rules) -> Result<bool> {
-        loop {
-            if self.discarding_input {
-                if let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') {
-                    self.input.drain(..=newline);
-                    self.discarding_input = false;
-                    continue;
-                }
-
-                self.input.clear();
-                return Ok(true);
-            }
-
-            let Some(newline) = self.input.iter().position(|byte| *byte == b'\n') else {
-                if self.input.len() > MAX_REQUEST_BYTES {
-                    self.input.clear();
-                    self.discarding_input = true;
-                    self.enqueue(error_response(
-                        Id::Null,
-                        PARSE_ERROR,
-                        "request exceeds the maximum frame size",
-                    ))?;
-
-                    return self.flush();
-                }
-
-                return Ok(true);
-            };
-
-            let line = self.input.drain(..=newline).collect::<Vec<_>>();
-
-            if newline > MAX_REQUEST_BYTES {
-                self.enqueue(error_response(
+    fn respond(
+        &mut self,
+        frame: Result<String, LinesCodecError>,
+        rules: &mut Rules,
+    ) -> Result<bool> {
+        // Reply to malformed frames without changing the active policy
+        let (response, update) = match frame {
+            Ok(line) => handle_request(&self.policy, rules, line.as_bytes()),
+            Err(error) => (
+                error_response(
                     Id::Null,
                     PARSE_ERROR,
-                    "request exceeds the maximum frame size",
-                ))?;
+                    match error {
+                        LinesCodecError::MaxLineLengthExceeded => {
+                            "request exceeds the maximum frame size"
+                        }
+                        LinesCodecError::Io(_) => "invalid JSON-RPC frame",
+                    },
+                ),
+                None,
+            ),
+        };
 
-                if !self.flush()? {
-                    return Ok(false);
-                }
+        // service() reserved sink capacity; encoding checks the byte limit before any update
+        self.stream.start_send_unpin(response)?;
 
-                if !self.output.is_empty() {
-                    return Ok(true);
-                }
-
-                continue;
-            }
-
-            let (response, update) = handle_request(&self.policy, rules, &line[..newline]);
-            self.enqueue(response)?;
-
-            if let Some(update) = update
-                && let Some(updated_rules) = self.policy.apply(update)
-            {
-                *rules = updated_rules;
-                self.policy_changed = true;
-            }
-
-            if !self.flush()? {
-                return Ok(false);
-            }
-
-            if !self.output.is_empty() {
-                return Ok(true);
-            }
-        }
-    }
-
-    fn enqueue(&mut self, response: Value) -> Result<()> {
-        if self.output_offset != 0 {
-            self.output.drain(..self.output_offset);
-            self.output_offset = 0;
+        // Keep the update in this poll with no intervening await
+        if let Some(update) = update
+            && let Some(updated_rules) = self.policy.apply(update)
+        {
+            *rules = updated_rules;
+            return Ok(true);
         }
 
-        let mut response =
-            serde_json::to_vec(&response).context("failed to encode RPC response")?;
-        response.push(b'\n');
-
-        if self.output.len() + response.len() > MAX_PENDING_RESPONSE_BYTES {
-            bail!("control response queue exceeded {MAX_PENDING_RESPONSE_BYTES} bytes");
-        }
-
-        self.output.extend(response);
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<bool> {
-        while self.output_offset < self.output.len() {
-            match self.stream.write(&self.output[self.output_offset..]) {
-                Ok(0) => return Ok(false),
-                Ok(n) => self.output_offset += n,
-                Err(err) if err.kind() == ErrorKind::WouldBlock => return Ok(true),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    return Ok(false);
-                }
-                Err(err) => return Err(err).context("failed to write the control socket"),
-            }
-        }
-
-        self.output.clear();
-        self.output_offset = 0;
-
-        Ok(true)
+        Ok(false)
     }
 }
 
-impl AsRawFd for Control {
-    fn as_raw_fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
+impl Drop for Control {
+    fn drop(&mut self) {
+        // Shut down the inherited connection even while the original descriptor remains open
+        let fd = self.stream.get_ref().as_raw_fd();
+
+        // Shut down writes first because macOS can reject SHUT_RDWR after a peer half-close
+        let _ = shutdown(fd, Shutdown::Write);
+        let _ = shutdown(fd, Shutdown::Read);
+    }
+}
+
+struct ControlCodec(LinesCodec);
+
+impl Decoder for ControlCodec {
+    type Item = Result<String, LinesCodecError>;
+    type Error = io::Error;
+
+    fn decode(&mut self, input: &mut BytesMut) -> io::Result<Option<Self::Item>> {
+        // Return malformed frames as RPC errors so later requests can still be processed
+        Ok(match self.0.decode(input) {
+            Ok(line) => line.map(Ok),
+            Err(error) => Some(Err(error)),
+        })
+    }
+
+    fn decode_eof(&mut self, input: &mut BytesMut) -> io::Result<Option<Self::Item>> {
+        let frame = self.decode(input)?;
+
+        // Unlike LinesCodec, discard an unterminated final request without applying it
+        if frame.is_none() {
+            input.clear();
+        }
+
+        Ok(frame)
+    }
+}
+
+impl Encoder<Value> for ControlCodec {
+    type Error = io::Error;
+
+    fn encode(&mut self, response: Value, output: &mut BytesMut) -> io::Result<()> {
+        let mut response = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        response.push(b'\n');
+
+        // Bound the complete encoded response before appending it
+        if output.len() + response.len() > MAX_PENDING_RESPONSE_BYTES {
+            return Err(io::Error::other(format!(
+                "control response queue exceeded {MAX_PENDING_RESPONSE_BYTES} bytes"
+            )));
+        }
+
+        output.extend_from_slice(&response);
+        Ok(())
     }
 }
 
@@ -533,18 +449,21 @@ fn validate_control_fd(control_fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Control, INVALID_PARAMS, INVALID_REQUEST, MAX_PENDING_RESPONSE_BYTES, MAX_REQUEST_BYTES,
-        MAX_RULES, METHOD_NOT_FOUND, PARSE_ERROR, Policy, handle_request,
+        Control, ControlCodec, INVALID_PARAMS, INVALID_REQUEST, MAX_PENDING_RESPONSE_BYTES,
+        MAX_REQUEST_BYTES, MAX_RULES, METHOD_NOT_FOUND, PARSE_ERROR, Policy, handle_request,
     };
     use crate::proxy::{Direction, PolicyDecision, Rule, Rules};
+    use bytes::BytesMut;
+    use futures_util::SinkExt;
     use serde_json::{Value, json};
     use smoltcp::wire::Ipv4Address;
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener};
+    use std::net::Shutdown;
     use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::time::Duration;
+    use tokio_util::codec::{Decoder, Encoder, LinesCodec};
 
     struct TestPolicy {
         state: Policy,
@@ -867,15 +786,11 @@ mod tests {
         assert_eq!(policy.result(), before);
     }
 
-    #[test]
-    fn newline_delimited_control_socket_handles_multiple_requests_and_eof() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn newline_delimited_control_socket_handles_multiple_requests_and_eof() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
-
         client
             .write_all(
                 concat!(
@@ -885,100 +800,101 @@ mod tests {
                 .as_bytes(),
             )
             .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
 
-        assert!(control.service(&mut rules).unwrap());
-        let mut response = [0; 2048];
-        let n = client.read(&mut response).unwrap();
-        let lines = std::str::from_utf8(&response[..n])
-            .unwrap()
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(false));
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(true));
+        assert_eq!(control.service(&mut rules).await.unwrap(), None);
+        assert_eq!(control.policy.allow, vec!["@host".parse().unwrap()]);
+        drop(control);
+
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        let responses = output
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0]["id"], 1);
-        assert_eq!(lines[1]["id"], 2);
-        assert_eq!(lines[1]["result"]["allow"], json!(["@host"]));
-        assert_eq!(control.policy.allow, vec!["@host".parse().unwrap()]);
-
-        let before = control.policy.result(rules.len());
-        drop(client);
-        assert!(!control.service(&mut rules).unwrap());
-        assert_eq!(control.policy.result(rules.len()), before);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[1]["id"], 2);
+        assert_eq!(responses[1]["result"]["allow"], json!(["@host"]));
     }
 
-    #[test]
-    fn policy_change_detection_uses_normalized_policy() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn policy_change_detection_uses_normalized_policy() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
-
-        client
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"out 10.1.2.3/8\"],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
+        for (allow, changed) in [("out 10.1.2.3/8", true), ("out 10.0.0.0/8", false)] {
+            writeln!(
+                client,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "softnet.policy.set",
+                    "params": {"allow": [allow], "block": ["in 10.0.0.0/8", "out 10.0.0.0/8"]}
+                })
+            )
             .unwrap();
-        assert!(control.service(&mut rules).unwrap());
-        assert!(control.policy_changed());
-
-        client
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"out 10.0.0.0/8\"],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
-            .unwrap();
-        assert!(control.service(&mut rules).unwrap());
-        assert!(!control.policy_changed());
-
+            assert_eq!(control.service(&mut rules).await.unwrap(), Some(changed));
+        }
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[],\"block\":[\"in 10.0.0.0/8\",\"out 10.0.0.0/8\"]}}\n")
             .unwrap();
-        assert!(control.service(&mut rules).unwrap());
-        assert!(control.policy_changed());
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(true));
         assert!(control.policy.allow.is_empty());
     }
 
-    #[test]
-    fn write_side_eof_flushes_the_final_policy_response() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_side_eof_flushes_the_final_policy_response() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
-
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
 
-        assert!(!control.service(&mut rules).unwrap());
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(true));
+        assert_eq!(control.service(&mut rules).await.unwrap(), None);
+        assert!(control.stream.write_buffer().is_empty());
+        drop(control);
 
-        let mut response = [0; 1024];
-        let n = client.read(&mut response).unwrap();
-        let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        let response = serde_json::from_str::<Value>(&response).unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["allow"], json!(["10.0.0.0/8"]));
-        assert!(control.output.is_empty());
     }
 
-    #[test]
-    fn oversized_frame_is_discarded_and_following_frame_is_processed() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_frame_is_discarded_and_following_frame_is_processed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut client = tokio::net::UnixStream::from_std(client).unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
-
-        control.input = vec![b'x'; MAX_REQUEST_BYTES + 1];
-        control.process_input(&mut rules).unwrap();
-        assert!(control.discarding_input);
-
-        control.input.extend_from_slice(
+        let mut input = vec![b'x'; MAX_REQUEST_BYTES + 1];
+        input.extend_from_slice(
             b"still-too-long\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.get\"}\n",
         );
-        control.process_input(&mut rules).unwrap();
-        assert!(!control.discarding_input);
-
-        let mut output = [0; 2048];
-        let n = client.read(&mut output).unwrap();
-        let responses = std::str::from_utf8(&output[..n])
-            .unwrap()
+        let (output, ()) = tokio::join!(
+            async {
+                client.write_all(&input).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut output = String::new();
+                client.read_to_string(&mut output).await.unwrap();
+                output
+            },
+            async {
+                assert_eq!(control.service(&mut rules).await.unwrap(), Some(false));
+                assert_eq!(control.service(&mut rules).await.unwrap(), Some(false));
+                assert_eq!(control.service(&mut rules).await.unwrap(), None);
+                drop(control);
+            }
+        );
+        let responses = output
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
@@ -987,105 +903,112 @@ mod tests {
         assert_eq!(responses[1]["id"], 2);
     }
 
-    #[test]
-    fn fragmented_frame_does_not_apply_until_the_newline_arrives() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragmented_frame_survives_cancelled_service() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
-
         client
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],",
-            )
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],")
             .unwrap();
-        assert!(control.service(&mut rules).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), control.service(&mut rules))
+                .await
+                .is_err()
+        );
         assert_eq!(control.policy.result(rules.len()), before);
-        assert!(control.output.is_empty());
+        assert!(control.stream.write_buffer().is_empty());
 
         client.write_all(b"\"block\":[]}}\n").unwrap();
-        assert!(control.service(&mut rules).unwrap());
-
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(true));
+        control.stream.flush().await.unwrap();
         let mut response = [0; 1024];
         let n = client.read(&mut response).unwrap();
         let response = serde_json::from_slice::<Value>(&response[..n - 1]).unwrap();
         assert_eq!(response["id"], 1);
         assert_eq!(response["result"]["allow"], json!(["@host"]));
-        assert_eq!(control.policy.allow, vec!["@host".parse().unwrap()]);
     }
 
     #[test]
-    fn response_backpressure_keeps_the_pending_queue_bounded() {
-        let (_client, server) = UnixStream::pair().unwrap();
-        let mut control = control(server.as_raw_fd()).unwrap();
-        let response = json!({"jsonrpc": "2.0", "id": 1, "result": "x".repeat(MAX_REQUEST_BYTES)});
-        let mut bounded = false;
+    fn codec_enforces_exact_request_and_response_limits() {
+        let mut codec = ControlCodec(LinesCodec::new_with_max_length(MAX_REQUEST_BYTES));
+        let mut input = BytesMut::from(vec![b'x'; MAX_REQUEST_BYTES].as_slice());
+        input.extend_from_slice(b"\n");
+        assert_eq!(
+            codec.decode(&mut input).unwrap().unwrap().unwrap().len(),
+            MAX_REQUEST_BYTES
+        );
+        input.resize(MAX_REQUEST_BYTES + 1, b'x');
+        assert!(codec.decode(&mut input).unwrap().unwrap().is_err());
+        input.extend_from_slice(b"discarded\nvalid\n");
+        assert_eq!(codec.decode(&mut input).unwrap().unwrap().unwrap(), "valid");
 
-        for _ in 0..8 {
-            match control.enqueue(response.clone()) {
-                Ok(()) => assert!(control.flush().unwrap()),
-                Err(error) => {
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("control response queue exceeded")
-                    );
-                    bounded = true;
-                    break;
-                }
-            }
-        }
-
-        assert!(bounded);
-        assert!(control.output.len() - control.output_offset <= 4 * MAX_REQUEST_BYTES);
+        let response = json!({"result": "x".repeat(MAX_REQUEST_BYTES)});
+        let mut output = BytesMut::new();
+        while codec.encode(response.clone(), &mut output).is_ok() {}
+        assert!(output.len() <= MAX_PENDING_RESPONSE_BYTES);
+        assert!(output.len() >= 3 * MAX_REQUEST_BYTES);
     }
 
-    #[test]
-    fn pipelined_policy_responses_stop_before_queue_overflow() {
-        let (_client, server) = UnixStream::pair().unwrap();
+    #[tokio::test(flavor = "current_thread")]
+    async fn pipelined_policy_responses_stop_before_queue_overflow() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let mut client = tokio::net::UnixStream::from_std(client).unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
         let allow = (0..MAX_RULES)
             .map(|index| format!("10.{}.{}.0/24", index / 256, index % 256))
             .collect::<Vec<_>>();
         let mut input = serde_json::to_vec(&json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "softnet.policy.set",
+            "jsonrpc": "2.0", "id": 0, "method": "softnet.policy.set",
             "params": {"allow": allow, "block": []}
         }))
         .unwrap();
         input.push(b'\n');
-
         for id in 1..=100 {
             input.extend_from_slice(
                 format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"softnet.policy.get\"}}\n")
                     .as_bytes(),
             );
         }
-
-        control.input = input;
-        assert!(control.process_input(&mut rules).unwrap());
+        let (written, processed) = tokio::join!(client.write_all(&input), async {
+            let mut processed = 0;
+            while let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(50), control.service(&mut rules)).await
+            {
+                assert!(result.unwrap().is_some());
+                processed += 1;
+                assert!(processed <= 101);
+            }
+            processed
+        });
+        written.unwrap();
+        assert!((1..101).contains(&processed));
         assert_eq!(rules.len(), MAX_RULES);
-        assert!(!control.input.is_empty());
-        assert!(!control.output.is_empty());
-        assert!(control.output.len() - control.output_offset <= MAX_PENDING_RESPONSE_BYTES);
+        assert!(!control.stream.write_buffer().is_empty());
+        assert!(control.stream.write_buffer().len() <= MAX_PENDING_RESPONSE_BYTES);
     }
 
-    #[test]
-    fn response_queue_overflow_does_not_apply_a_policy_update() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_queue_overflow_does_not_apply_a_policy_update() {
         let (_client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
-
-        control.output = vec![b'x'; MAX_PENDING_RESPONSE_BYTES];
-        control.input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n".to_vec();
-
-        let error = control.process_input(&mut rules).unwrap_err();
+        control
+            .stream
+            .write_buffer_mut()
+            .resize(MAX_PENDING_RESPONSE_BYTES, b'x');
+        let error = control
+            .respond(
+                Ok("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}".into()),
+                &mut rules,
+            )
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1094,39 +1017,96 @@ mod tests {
         assert_eq!(control.policy.result(rules.len()), before);
     }
 
-    #[test]
-    fn response_backpressure_stops_consuming_policy_updates() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn backpressure_survives_cancellation_and_stops_policy_updates() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut control = control(server.as_raw_fd()).unwrap();
         let mut rules = Rules::default();
         let before = control.policy.result(rules.len());
-
-        control.output = vec![b'x'; MAX_REQUEST_BYTES];
-        assert!(control.flush().unwrap());
-        assert!(!control.output.is_empty());
-
+        let response = json!({"jsonrpc": "2.0", "id": 0, "result": "x".repeat(MAX_REQUEST_BYTES)});
+        control.stream.start_send_unpin(response.clone()).unwrap();
         client
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"10.0.0.0/8\"],\"block\":[]}}\n")
             .unwrap();
-
-        assert!(control.service(&mut rules).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), control.service(&mut rules))
+                .await
+                .is_err()
+        );
         assert_eq!(control.policy.result(rules.len()), before);
-        assert!(control.input.is_empty());
+        assert!(control.stream.read_buffer().is_empty());
+        assert!(!control.stream.write_buffer().is_empty());
+        client.set_nonblocking(true).unwrap();
+        let mut client = BufReader::new(tokio::net::UnixStream::from_std(client).unwrap());
+        let mut line = String::new();
+        let (changed, _) = tokio::join!(control.service(&mut rules), client.read_line(&mut line));
+        assert_eq!(changed.unwrap(), Some(true));
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), response);
+        line.clear();
+        let (flushed, read) = tokio::join!(control.stream.flush(), client.read_line(&mut line));
+        flushed.unwrap();
+        read.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
     }
 
-    #[test]
-    fn validates_control_descriptor_without_taking_ownership() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unterminated_request_at_eof_does_not_change_policy() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = Rules::default();
+        let before = control.policy.result(rules.len());
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"softnet.policy.set\",\"params\":{\"allow\":[\"@host\"],\"block\":[]}}")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(control.service(&mut rules).await.unwrap(), None);
+        assert_eq!(control.policy.result(rules.len()), before);
+        assert!(control.stream.write_buffer().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_utf8_frame_does_not_prevent_following_request() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut control = control(server.as_raw_fd()).unwrap();
+        let mut rules = Rules::default();
+        client
+            .write_all(b"\xff\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"softnet.policy.get\"}\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(false));
+        assert_eq!(control.service(&mut rules).await.unwrap(), Some(false));
+        assert_eq!(control.service(&mut rules).await.unwrap(), None);
+        drop(control);
+        let mut output = String::new();
+        client.read_to_string(&mut output).unwrap();
+        let responses = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(responses[1]["id"], 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validates_control_descriptor_without_taking_ownership() {
         let file = File::open("/dev/null").unwrap();
         let error = control(file.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("is not a socket"));
         assert!(file.metadata().is_ok());
-
         let (datagram, _) = UnixDatagram::pair().unwrap();
         let error = control(datagram.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("not a Unix stream socket"));
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let error = control(listener.as_raw_fd()).err().unwrap();
+        let internet = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Inet,
+            nix::sys::socket::SockType::Stream,
+            nix::sys::socket::SockFlag::empty(),
+            None,
+        )
+        .unwrap();
+        let error = control(internet.as_raw_fd()).err().unwrap();
         assert!(error.to_string().contains("not a Unix socket"));
 
         let (stream, _peer) = UnixStream::pair().unwrap();
@@ -1135,17 +1115,11 @@ mod tests {
         assert!(unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) != -1 });
     }
 
-    #[test]
-    fn shutdown_signals_eof_while_the_original_descriptor_remains_open() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_control_signals_eof_while_the_original_descriptor_remains_open() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
         let control = control(server.as_raw_fd()).unwrap();
-
-        control.shutdown().unwrap();
         drop(control);
-
         assert!(unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFD) != -1 });
         let mut response = [0; 1];
         assert_eq!(client.read(&mut response).unwrap(), 0);

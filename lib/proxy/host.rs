@@ -5,7 +5,7 @@ use dhcproto::v4::{CLIENT_PORT, SERVER_PORT};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket};
 
-impl Proxy<'_> {
+impl Proxy {
     pub(crate) fn process_frame_from_host(&mut self, frame: &EthernetFrame<&[u8]>) -> Result<()> {
         if self.allowed_from_host(frame).is_none() {
             // Block packet by not forwarding it to the VM

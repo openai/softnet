@@ -4,9 +4,9 @@ use clap::ValueEnum;
 use log::info;
 use smoltcp::wire::EthernetAddress;
 use std::net::Ipv4Addr;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::net::UnixDatagram;
+use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
+use tokio::sync::Notify;
 use vmnet::network::Mode;
 use vmnet::parameters::{Parameter, ParameterKind};
 use vmnet::port_forwarding::{AddressFamily, Protocol};
@@ -26,8 +26,9 @@ pub enum NetType {
 
 pub struct Host {
     interface: vmnet::Interface,
-    new_packets_rx: UnixDatagram,
-    callback_can_continue_tx: SyncSender<()>,
+    ready: Arc<Notify>,
+    draining: bool,
+    callback_can_continue_tx: Option<SyncSender<()>>,
     pub vm_ip: Ipv4Addr,
     pub subnet_mask: Ipv4Addr,
     pub gateway_ip: smoltcp::wire::Ipv4Address,
@@ -98,33 +99,26 @@ impl Host {
             ));
         };
 
-        // Set up a socketpair() to emulate polling of the vmnet interface
-        let (new_packets_tx, new_packets_rx) = UnixDatagram::pair()?;
-        new_packets_rx.set_nonblocking(true)?;
-
-        let (callback_can_continue_tx, callback_can_continue_rx) = sync_channel(0);
+        // Coordinate packet readiness and callback acknowledgments
+        let ready = Arc::new(Notify::new());
+        let ready_for_callback = Arc::clone(&ready);
+        let (callback_can_continue_tx, callback_can_continue_rx) = sync_channel(1);
 
         interface
             .set_event_callback(Events::PACKETS_AVAILABLE, move |_mask, _params| {
-                // Send a dummy datagram to make the other end of socketpair() readable
-                // and ignore the error as this merely a signalling channel to wake up
-                // the poller
-                new_packets_tx.send(&[0; 1]).ok();
+                // Wake the Tokio reader to drain the available packets
+                ready_for_callback.notify_one();
 
-                // Wait for the permission to continue to avoid
-                // wasting CPU cycles or in case of termination,
-                // to unblock this Block[1] and allow
-                // vmnet.framework to terminate
-                //
-                // [1]: https://en.wikipedia.org/wiki/Blocks_(C_language_extension)
-                callback_can_continue_rx.recv().unwrap();
+                // Park this GCD worker until drained; returning early makes vmnet repeat callbacks
+                let _ = callback_can_continue_rx.recv();
             })
             .context("failed to set vmnet interface's event callback")?;
 
         Ok(Host {
             interface,
-            new_packets_rx,
-            callback_can_continue_tx,
+            ready,
+            draining: false,
+            callback_can_continue_tx: Some(callback_can_continue_tx),
             vm_ip,
             subnet_mask,
             gateway_ip,
@@ -158,22 +152,26 @@ impl Host {
             .map_err(|err| anyhow!("failed to add port forwarding rule {details}: {err}"))
     }
 
-    pub fn read(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> vmnet::Result<usize> {
-        // Dequeue dummy datagram from the socket (if any)
-        // to free up buffer space and reduce false-positives
-        // when polling
-        let mut buf_to_be_discarded: [u8; 1] = [0; 1];
-        let _ = self.new_packets_rx.recv(&mut buf_to_be_discarded);
+    pub async fn read(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> vmnet::Result<usize> {
+        loop {
+            // One callback can cover several batches; stay ready until an empty read
+            if !self.draining {
+                self.ready.notified().await;
+                self.draining = true;
+            }
 
-        let result = self.interface.read_batch(batch, bufs);
+            match self.interface.read_batch(batch, bufs) {
+                Err(vmnet::Error::VmnetReadNothing) => {
+                    self.draining = false;
 
-        if let Err(vmnet::Error::VmnetReadNothing) = result {
-            // We've emptied everything, unlock the callback
-            // so that it will be able to pick up new events
-            let _ = self.callback_can_continue_tx.send(());
+                    if let Some(tx) = &self.callback_can_continue_tx {
+                        // Buffer the acknowledgment so the reader never waits for the callback
+                        let _ = tx.try_send(());
+                    }
+                }
+                result => return result,
+            }
         }
-
-        result
     }
 
     pub fn write(&mut self, buf: &[u8]) -> vmnet::Result<usize> {
@@ -181,21 +179,21 @@ impl Host {
     }
 
     pub fn finalize(&mut self) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+
         // First make sure our callback won't be scheduled again after it finishes
-        self.interface
-            .clear_event_callback()
-            .context("failed to clear vmnet interface's event callback")?;
+        let clear_result = self.interface.clear_event_callback();
 
-        // Now let the callback finish
-        let _ = self.callback_can_continue_tx.send(());
+        // Disconnecting releases the callback during shutdown without waiting for a receiver
+        self.callback_can_continue_tx.take();
 
-        self.interface
-            .finalize()
-            .context("failed to finalize vmnet's interface")?;
+        let stop_result = self.interface.finalize();
+        self.finalized = stop_result.is_ok();
 
-        self.finalized = true;
-
-        Ok(())
+        clear_result.context("failed to clear vmnet interface's event callback")?;
+        stop_result.context("failed to finalize vmnet's interface")
     }
 }
 
@@ -204,11 +202,5 @@ impl Drop for Host {
         if !self.finalized {
             let _ = self.finalize();
         }
-    }
-}
-
-impl AsRawFd for Host {
-    fn as_raw_fd(&self) -> RawFd {
-        self.new_packets_rx.as_raw_fd()
     }
 }
