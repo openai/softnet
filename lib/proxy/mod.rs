@@ -9,26 +9,25 @@ mod vm;
 use crate::dhcp_server::{DHCP_SERVER_MAC, DhcpServer};
 use crate::host::Host;
 use crate::host::NetType;
-use crate::poller::Poller;
 use crate::vm::VM;
 use anyhow::{Context, Result, bail};
 use control::{Control, normalize_rules};
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
+use futures_util::future::OptionFuture;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 pub use rule::{Direction, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
-use std::io::ErrorKind;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::time::Duration;
+use tokio::time::{MissedTickBehavior, interval};
 use vmnet::Batch;
 
-pub struct Proxy<'proxy> {
+pub struct Proxy {
     vm: VM,
     host: Host,
-    poller: Poller<'proxy>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_server: DhcpServer,
     rules: Rules,
@@ -37,8 +36,9 @@ pub struct Proxy<'proxy> {
     enobufs_encountered: bool,
 }
 
-impl Proxy<'_> {
-    pub fn new<'proxy>(
+impl Proxy {
+    /// Requires an entered Tokio runtime during construction.
+    pub fn new(
         vm_fd: RawFd,
         vm_mac_address: MacAddress,
         vm_net_type: NetType,
@@ -46,7 +46,7 @@ impl Proxy<'_> {
         block: Vec<Rule>,
         exposed_ports: Vec<ExposedPort>,
         control_fd: Option<RawFd>,
-    ) -> Result<Proxy<'proxy>> {
+    ) -> Result<Proxy> {
         // Ensure that VM's MAC address won't conflict with our DHCP server's MAC address
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
         if vm_mac_address == DHCP_SERVER_MAC {
@@ -62,18 +62,11 @@ impl Proxy<'_> {
             vm_mac_address,
             !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
         )?;
-        let poller_timeout = Duration::from_millis(100);
         let control = control_fd
             .map(|control_fd| {
                 Control::new(control_fd, host.gateway_ip, allow.clone(), block.clone())
             })
             .transpose()?;
-        let poller = Poller::new(
-            vm.as_raw_fd(),
-            host.as_raw_fd(),
-            control.as_ref().map(AsRawFd::as_raw_fd),
-            poller_timeout,
-        )?;
 
         let rules = Rules::new(host.gateway_ip, &allow, &block);
 
@@ -99,7 +92,6 @@ impl Proxy<'_> {
         Ok(Proxy {
             vm,
             host,
-            poller,
             vm_mac_address,
             dhcp_server,
             rules,
@@ -109,7 +101,7 @@ impl Proxy<'_> {
         })
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         // Create a single buffer from reading from the VM
         let mut buf: Vec<u8> = vec![0; self.host.max_packet_size as usize];
 
@@ -120,129 +112,93 @@ impl Proxy<'_> {
         ];
         let mut batch = Batch::preallocate(bufs.len());
 
-        self.poller.arm()?;
+        // Check VM connectivity periodically, skipping missed ticks
+        let mut maintenance = interval(Duration::from_millis(100));
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+        // Service packet I/O, policy changes, and maintenance on the same runtime
         loop {
-            let (vm_readable, host_readable, interrupt) = self.poller.wait()?;
+            tokio::select! {
+                result = self.vm.read(&mut buf) => {
+                    let n = result?;
 
-            // Update coarse time for flows
-            coarsetime::Instant::update();
-
-            // Service control on every wake (including timeouts) so a bounded read or a pending
-            // response continues making progress even when no new edge is generated.
-            self.service_control();
-
-            if vm_readable {
-                self.read_from_vm(buf.as_mut_slice())?;
-            }
-
-            if host_readable {
-                self.read_from_host(&mut batch, &mut bufs)?;
-            }
-
-            // Graceful termination
-            if interrupt {
-                return Ok(());
-            }
-
-            // Periodic maintenance
-            if self.poller.periodic_tick_due() {
-                // kqueue(2) does not report peer disconnects for Unix datagram sockets
-                if !self.vm.is_connected()? {
-                    return Ok(());
-                }
-            }
-
-            self.poller.rearm();
-        }
-    }
-
-    fn read_from_vm(&mut self, buf: &mut [u8]) -> Result<()> {
-        let mut packets_read = 0;
-
-        loop {
-            match self.vm.read(buf) {
-                Ok(n) => {
-                    // Update coarse time for flows
+                    // Update the coarse time once the packet arrives
                     coarsetime::Instant::update();
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
                         self.process_frame_from_vm(frame)?;
                     }
 
-                    packets_read += 1;
-                    if packets_read == 128 {
-                        self.service_control();
-                        packets_read = 0;
+                    // Limit VM bursts to 128 packets (including the one we read above),
+                    // so that other select branches will have a chance to run
+                    for _ in 0..127 {
+                        match self.vm.try_read(&mut buf) {
+                            Ok(n) => {
+                                coarsetime::Instant::update();
+
+                                if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
+                                    self.process_frame_from_vm(frame)?;
+                                }
+
+                                tokio::task::consume_budget().await;
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(err) => return Err(err.into()),
+                        }
                     }
                 }
-                Err(err) => {
-                    if err.kind() == ErrorKind::WouldBlock {
-                        return Ok(());
-                    }
 
-                    return Err(err.into());
-                }
-            }
-        }
-    }
+                result = self.host.read(&mut batch, &mut bufs) => {
+                    let pktcnt = result?;
 
-    fn read_from_host(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> Result<()> {
-        loop {
-            match self.host.read(batch, bufs) {
-                Ok(pktcnt) => {
-                    // Update coarse time for flows
+                    // Update the coarse time once the packet arrives
                     coarsetime::Instant::update();
 
-                    for buf in batch.packet_sized_bufs(bufs).take(pktcnt) {
+                    for buf in batch.packet_sized_bufs(&bufs).take(pktcnt) {
                         if let Ok(pkt) = EthernetFrame::new_checked(buf) {
                             self.process_frame_from_host(&pkt)?;
                         }
+
+                        tokio::task::consume_budget().await;
+                    }
+                }
+
+                // Skip this branch when no control socket is present
+                Some(result) = OptionFuture::from(
+                    self.control
+                        .as_mut()
+                        .map(|control| control.service(&mut self.rules))
+                ) => {
+                    match result {
+                        Ok(Some(true)) => {
+                            // Invalidate tracked flows whenever the policy changes
+                            self.flows = self.rules.has_stateful().then(FlowTable::new);
+                        }
+                        Ok(Some(false)) => {
+                            // Policy unchanged; keep tracked flows intact
+                        }
+                        Ok(None) => {
+                            // Control stream reached EOF; stop polling it
+                            self.control = None;
+                        }
+                        Err(err) => {
+                            // Control service failed; stop polling it
+                            self.control = None;
+
+                            log::warn!("disabling Softnet control socket: {err:#}");
+                        }
                     }
 
-                    self.service_control();
+                    coarsetime::Instant::update();
                 }
-                Err(err) => {
-                    if let vmnet::Error::VmnetReadNothing = err {
+
+                _ = maintenance.tick() => {
+                    // Unix datagram sockets do not report peer closure as readable
+                    if !self.vm.is_connected()? {
                         return Ok(());
                     }
-
-                    return Err(err.into());
                 }
             }
-        }
-    }
-
-    fn service_control(&mut self) {
-        let Some(control) = self.control.as_mut() else {
-            return;
-        };
-
-        let keep_open = match control.service(&mut self.rules) {
-            Ok(keep_open) => keep_open,
-            Err(err) => {
-                log::warn!("disabling Softnet control socket: {err:#}");
-                false
-            }
-        };
-
-        // Invalidate tracked flows whenever the policy changes
-        if control.policy_changed() {
-            self.flows = self.rules.has_stateful().then(FlowTable::new);
-        }
-
-        if keep_open {
-            return;
-        }
-
-        if let Err(err) = self.poller.remove_control() {
-            log::warn!("failed to remove Softnet control socket from the poller: {err:#}");
-        }
-
-        if let Some(control) = self.control.take()
-            && let Err(err) = control.shutdown()
-        {
-            log::warn!("failed to shut down Softnet control socket: {err:#}");
         }
     }
 
@@ -285,9 +241,9 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::str::FromStr;
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_blocking_takes_precedence() {
+    async fn test_blocking_takes_precedence() {
         let mut proxy = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
         let vm_ip = proxy.host.vm_ip;
 
@@ -296,9 +252,9 @@ mod tests {
         assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66").is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_longest_prefix_match_wins() {
+    async fn test_longest_prefix_match_wins() {
         let mut proxy = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
         let vm_ip = proxy.host.vm_ip;
 
@@ -309,9 +265,9 @@ mod tests {
         assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34").is_none());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_allow_host() {
+    async fn test_allow_host() {
         let mut proxy = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
 
@@ -325,9 +281,9 @@ mod tests {
         assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip).is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
+    async fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
         let mut proxy = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
         let fallback_peer = Ipv4Address::new(203, 0, 113, 1);
@@ -350,9 +306,9 @@ mod tests {
         assert!(proxy.allowed_from_vm_ipv4(allowed_reply).is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
+    async fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
         let mut proxy = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
         let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
@@ -366,9 +322,9 @@ mod tests {
         assert!(proxy.allowed_from_vm_ipv4(reply).is_some());
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
+    async fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
         let mut proxy = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
         let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
@@ -382,7 +338,7 @@ mod tests {
         assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
     }
 
-    fn create_proxy<'test>(allow: Vec<&str>, block: Vec<&str>) -> Proxy<'test> {
+    fn create_proxy(allow: Vec<&str>, block: Vec<&str>) -> Proxy {
         let (vm_fd, _) = socketpair(
             AddressFamily::Unix,
             SockType::Datagram,

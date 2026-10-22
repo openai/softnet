@@ -11,7 +11,7 @@ use smoltcp::wire::{
 
 const IPV4_HEADER_LEN_WITHOUT_OPTIONS: u8 = 20;
 
-impl Proxy<'_> {
+impl Proxy {
     pub(crate) fn process_frame_from_vm(&mut self, frame: EthernetFrame<&[u8]>) -> Result<()> {
         if self.allowed_from_vm(&frame).is_none() {
             // Block packet by not forwarding it to the host

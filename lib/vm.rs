@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixDatagram;
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 pub struct VM {
-    sock: UnixDatagram,
+    sock: AsyncFd<UnixDatagram>,
 }
 
 impl VM {
@@ -16,19 +18,27 @@ impl VM {
         let sock = unsafe { UnixDatagram::from_raw_fd(vm_fd) };
         sock.set_nonblocking(true)?;
 
-        Ok(VM { sock })
+        Ok(VM {
+            sock: AsyncFd::new(sock)?,
+        })
     }
 
     pub fn write(&self, pkt: &[u8]) -> std::io::Result<usize> {
-        self.sock.send(pkt)
+        self.sock.get_ref().send(pkt)
     }
 
-    pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.sock.recv(buf)
+    pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.sock.get_ref().recv(buf)
+    }
+
+    pub async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.sock
+            .async_io(Interest::READABLE, |sock| sock.recv(buf))
+            .await
     }
 
     pub fn is_connected(&self) -> io::Result<bool> {
-        match self.sock.peer_addr() {
+        match self.sock.get_ref().peer_addr() {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(false),
             Err(error) => Err(error),
@@ -114,16 +124,9 @@ fn validate_vm_fd(vm_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-impl AsRawFd for VM {
-    fn as_raw_fd(&self) -> RawFd {
-        self.sock.as_raw_fd()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::VM;
-    use polling::{Event, Events, PollMode, Poller};
     use std::fs::File;
     use std::net::UdpSocket;
     use std::os::fd::AsRawFd;
@@ -180,8 +183,8 @@ mod tests {
         assert!(error.to_string().contains("not a Unix socket"));
     }
 
-    #[test]
-    fn test_new_does_not_close_original_fd_when_vm_is_dropped() {
+    #[tokio::test]
+    async fn test_new_does_not_close_original_fd_when_vm_is_dropped() {
         let (socket, _peer) = UnixDatagram::pair().unwrap();
         let vm = VM::new(socket.as_raw_fd()).unwrap();
         drop(vm);
@@ -198,61 +201,52 @@ mod tests {
         assert!(socket_fd_is_open);
     }
 
-    #[test]
-    fn test_connected_socket_has_peer() {
+    #[tokio::test]
+    async fn test_connected_socket_has_peer() {
         let (socket, _peer) = UnixDatagram::pair().unwrap();
         let vm = VM::new(socket.as_raw_fd()).unwrap();
 
         assert!(vm.is_connected().unwrap());
     }
 
-    #[test]
-    fn test_disconnected_peer_is_detected_without_kqueue_event() {
+    #[tokio::test]
+    async fn test_disconnected_peer_is_detected_without_readiness() {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         let vm = VM::new(socket.as_raw_fd()).unwrap();
-        let poller = Poller::new().unwrap();
-        let mut events = Events::new();
-
-        unsafe {
-            poller
-                .add_with_mode(vm.as_raw_fd(), Event::readable(0), PollMode::Edge)
-                .unwrap();
-        }
+        let mut buf = [0];
         drop(peer);
 
-        poller
-            .wait(&mut events, Some(Duration::from_millis(20)))
-            .unwrap();
-
-        assert!(events.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), vm.read(&mut buf))
+                .await
+                .is_err()
+        );
         assert!(!vm.is_connected().unwrap());
     }
 
-    #[test]
-    fn test_disconnected_peer_is_detected_when_another_socket_wakes_kqueue() {
+    #[tokio::test]
+    async fn test_disconnected_peer_is_detected_when_another_socket_is_readable() {
         let (socket, peer) = UnixDatagram::pair().unwrap();
         let (host, host_peer) = UnixDatagram::pair().unwrap();
         let vm = VM::new(socket.as_raw_fd()).unwrap();
-        let poller = Poller::new().unwrap();
-        let mut events = Events::new();
-
-        unsafe {
-            poller
-                .add_with_mode(vm.as_raw_fd(), Event::readable(0), PollMode::Edge)
-                .unwrap();
-            poller
-                .add_with_mode(host.as_raw_fd(), Event::readable(1), PollMode::Edge)
-                .unwrap();
-        }
+        host.set_nonblocking(true).unwrap();
+        let host = tokio::net::UnixDatagram::from_std(host).unwrap();
+        let mut buf = [0];
         drop(peer);
         host_peer.send(&[1]).unwrap();
 
-        poller
-            .wait(&mut events, Some(Duration::from_millis(20)))
-            .unwrap();
-
-        assert!(events.iter().any(|event| event.key == 1));
-        assert!(!events.iter().any(|event| event.key == 0));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), host.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), vm.read(&mut buf))
+                .await
+                .is_err()
+        );
         assert!(!vm.is_connected().unwrap());
     }
 }
