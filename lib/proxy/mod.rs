@@ -1,4 +1,3 @@
-mod control;
 mod exposed_port;
 mod flows;
 mod host;
@@ -6,24 +5,41 @@ mod rule;
 mod rules;
 mod vm;
 
-use crate::dhcp_server::{DHCP_SERVER_MAC, DhcpServer};
+use crate::dhcp_server::DhcpServer;
 use crate::host::Host;
-use crate::host::NetType;
+use crate::network::Network;
 use crate::vm::VM;
-use anyhow::{Context, Result, bail};
-use control::{Control, normalize_rules};
+use anyhow::{Context, Result};
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
-use futures_util::future::OptionFuture;
 use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 pub use rule::{Direction, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
-use std::os::unix::io::RawFd;
+use std::net::Ipv4Addr;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
 use vmnet::Batch;
+
+pub(crate) enum Command {
+    PolicyGet {
+        reply: oneshot::Sender<Policy>,
+    },
+    PolicySet {
+        allow: Vec<Rule>,
+        block: Vec<Rule>,
+        reply: oneshot::Sender<Policy>,
+    },
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Policy {
+    pub(crate) allow: Vec<Rule>,
+    pub(crate) block: Vec<Rule>,
+    pub(crate) rule_count: usize,
+}
 
 pub struct Proxy {
     vm: VM,
@@ -31,42 +47,33 @@ pub struct Proxy {
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_server: DhcpServer,
     rules: Rules,
-    control: Option<Control>,
+    allow: Vec<Rule>,
+    block: Vec<Rule>,
     flows: Option<FlowTable>,
     enobufs_encountered: bool,
 }
 
 impl Proxy {
-    /// Requires an entered Tokio runtime during construction.
-    pub fn new(
-        vm_fd: RawFd,
+    /// Creates the VM interface and packet policy using the entered Tokio runtime.
+    pub(crate) fn new(
+        vm: VM,
         vm_mac_address: MacAddress,
-        vm_net_type: NetType,
+        vm_ip: Ipv4Addr,
+        network: &Network,
         allow: Vec<Rule>,
         block: Vec<Rule>,
         exposed_ports: Vec<ExposedPort>,
-        control_fd: Option<RawFd>,
     ) -> Result<Proxy> {
-        // Ensure that VM's MAC address won't conflict with our DHCP server's MAC address
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
-        if vm_mac_address == DHCP_SERVER_MAC {
-            bail!("VM MAC address {vm_mac_address} is reserved for the DHCP server");
-        }
-
         let allow = normalize_rules(allow);
         let block = normalize_rules(block);
 
-        let vm = VM::new(vm_fd)?;
+        // Create this VM's vmnet interface on the shared network
         let mut host = Host::new(
-            vm_net_type,
-            vm_mac_address,
+            network,
+            vm_ip,
             !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
         )?;
-        let control = control_fd
-            .map(|control_fd| {
-                Control::new(control_fd, host.gateway_ip, allow.clone(), block.clone())
-            })
-            .transpose()?;
 
         let rules = Rules::new(host.gateway_ip, &allow, &block);
 
@@ -74,16 +81,15 @@ impl Proxy {
         // traffic admitted through implicit global and gateway fallbacks
         let flows = rules.has_stateful().then(FlowTable::new);
 
-        // vmnet owns the gateway (including ARP and DNS); the VM address is
-        // reserved for this MAC for the lifetime of the attached interface.
+        // Serve the VM's reserved address over DHCP
         let dhcp_server = DhcpServer::new(
             vm_mac_address,
             host.vm_ip,
-            host.subnet_mask,
+            network.subnet.netmask(),
             host.gateway_ip,
         );
 
-        // Install port forwardings for the reserved VM's IP address
+        // Install port forwardings for the VM's reserved IP address
         for port in exposed_ports {
             host.port_forwarding_add_rule(port.external_port, host.vm_ip, port.internal_port)
                 .context("failed to configure port forwarding")?;
@@ -95,13 +101,14 @@ impl Proxy {
             vm_mac_address,
             dhcp_server,
             rules,
-            control,
+            allow,
+            block,
             flows,
             enobufs_encountered: false,
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub(crate) async fn run(&mut self, mut commands_rx: mpsc::Receiver<Command>) -> Result<()> {
         // Create a single buffer from reading from the VM
         let mut buf: Vec<u8> = vec![0; self.host.max_packet_size as usize];
 
@@ -120,7 +127,17 @@ impl Proxy {
         loop {
             tokio::select! {
                 result = self.vm.read(&mut buf) => {
-                    let n = result?;
+                    let n = match result {
+                        Ok(n) => n,
+                        Err(error) => {
+                            // Treat peer closure as normal VM shutdown
+                            if self.vm.is_disconnect(&error)? {
+                                return Ok(());
+                            }
+
+                            return Err(error.into());
+                        }
+                    };
 
                     // Update the coarse time once the packet arrives
                     coarsetime::Instant::update();
@@ -142,8 +159,19 @@ impl Proxy {
 
                                 tokio::task::consume_budget().await;
                             }
-                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(err) => return Err(err.into()),
+                            Err(err) => {
+                                // End this burst once all queued packets have been drained
+                                if err.kind() == std::io::ErrorKind::WouldBlock {
+                                    break;
+                                }
+
+                                // Treat peer closure as normal VM shutdown
+                                if self.vm.is_disconnect(&err)? {
+                                    return Ok(());
+                                }
+
+                                return Err(err.into());
+                            }
                         }
                     }
                 }
@@ -155,41 +183,32 @@ impl Proxy {
                     coarsetime::Instant::update();
 
                     for buf in batch.packet_sized_bufs(&bufs).take(pktcnt) {
-                        if let Ok(pkt) = EthernetFrame::new_checked(buf) {
-                            self.process_frame_from_host(&pkt)?;
-                        }
+                        if let Ok(pkt) = EthernetFrame::new_checked(buf)
+                            && let Err(error) = self.process_frame_from_host(&pkt) {
+                                // Treat peer closure as normal VM shutdown
+                                if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+                                    && self.vm.is_disconnect(io_error)?
+                                {
+                                    return Ok(());
+                                }
+
+                                return Err(error);
+                            }
 
                         tokio::task::consume_budget().await;
                     }
                 }
 
-                // Skip this branch when no control socket is present
-                Some(result) = OptionFuture::from(
-                    self.control
-                        .as_mut()
-                        .map(|control| control.service(&mut self.rules))
-                ) => {
-                    match result {
-                        Ok(Some(true)) => {
-                            // Invalidate tracked flows whenever the policy changes
-                            self.flows = self.rules.has_stateful().then(FlowTable::new);
+                command = commands_rx.recv() => {
+                    match command {
+                        Some(Command::PolicyGet { reply }) => {
+                            let _ = reply.send(self.policy_get());
                         }
-                        Ok(Some(false)) => {
-                            // Policy unchanged; keep tracked flows intact
+                        Some(Command::PolicySet { allow, block, reply }) => {
+                            let _ = reply.send(self.policy_set(allow, block));
                         }
-                        Ok(None) => {
-                            // Control stream reached EOF; stop polling it
-                            self.control = None;
-                        }
-                        Err(err) => {
-                            // Control service failed; stop polling it
-                            self.control = None;
-
-                            log::warn!("disabling Softnet control socket: {err:#}");
-                        }
+                        None => return Ok(()),
                     }
-
-                    coarsetime::Instant::update();
                 }
 
                 _ = maintenance.tick() => {
@@ -228,23 +247,59 @@ impl Proxy {
             Some(())
         }
     }
+
+    pub(crate) fn policy_get(&self) -> Policy {
+        Policy {
+            allow: self.allow.clone(),
+            block: self.block.clone(),
+            rule_count: self.rules.len(),
+        }
+    }
+
+    pub(crate) fn policy_set(&mut self, allow: Vec<Rule>, block: Vec<Rule>) -> Policy {
+        let allow = normalize_rules(allow);
+        let block = normalize_rules(block);
+
+        // Keep existing tracked flows when the normalized policy is unchanged
+        if self.allow != allow || self.block != block {
+            self.rules = Rules::new(self.host.gateway_ip, &allow, &block);
+            self.allow = allow;
+            self.block = block;
+            self.flows = self.rules.has_stateful().then(FlowTable::new);
+        }
+
+        self.policy_get()
+    }
+
+    pub(crate) fn finalize(&mut self) -> Result<()> {
+        self.host.finalize()
+    }
+}
+
+fn normalize_rules(mut rules: Vec<Rule>) -> Vec<Rule> {
+    rules.iter_mut().for_each(|rule| *rule = rule.normalized());
+    rules.sort_by_key(ToString::to_string);
+    rules.dedup();
+
+    rules
 }
 
 #[cfg(test)]
 mod tests {
     use crate::NetType;
-    use crate::proxy::Proxy;
+    use crate::proxy::{Policy, Proxy};
+    use crate::vm::VM;
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use serial_test::serial;
     use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::str::FromStr;
 
     #[tokio::test]
     #[serial]
     async fn test_blocking_takes_precedence() {
-        let mut proxy = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
+        let (mut proxy, _peer) = create_proxy(vec!["66.66.0.0/16"], vec!["66.66.0.0/16"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 1);
@@ -255,7 +310,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_longest_prefix_match_wins() {
-        let mut proxy = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
+        let (mut proxy, _peer) = create_proxy(vec!["33.33.33.33/32"], vec!["33.33.33.0/24"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
@@ -268,7 +323,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_allow_host() {
-        let mut proxy = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
+        let (mut proxy, _peer) = create_proxy(vec!["@host"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
 
         assert_eq!(proxy.rules.len(), 2);
@@ -284,7 +339,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_bare_default_block_applies_in_both_directions_in_stateful_mode() {
-        let mut proxy = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
+        let (mut proxy, _peer) = create_proxy(vec!["in 192.0.2.0/24"], vec!["0.0.0.0/0"]);
         let vm_ip = proxy.host.vm_ip;
         let fallback_peer = Ipv4Address::new(203, 0, 113, 1);
         let explicitly_allowed_peer = Ipv4Address::new(192, 0, 2, 1);
@@ -309,7 +364,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
-        let mut proxy = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
+        let (mut proxy, _peer) = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
         let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
 
@@ -325,7 +380,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_directional_ingress_block_does_not_block_reply_to_bare_outbound_allow() {
-        let mut proxy = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
+        let (mut proxy, _peer) = create_proxy(vec!["203.0.113.0/24"], vec!["in 203.0.113.0/24"]);
         let vm_ip = proxy.host.vm_ip;
         let peer = Ipv4Address::new(203, 0, 113, 1);
 
@@ -338,20 +393,62 @@ mod tests {
         assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
     }
 
-    fn create_proxy(allow: Vec<&str>, block: Vec<&str>) -> Proxy {
-        let (vm_fd, _) = socketpair(
+    #[tokio::test]
+    #[serial]
+    async fn policy_replacement_normalizes_rules_and_preserves_flows_on_retry() {
+        let (mut proxy, _peer) = create_proxy(
+            vec!["out 10.1.2.3/8", "out 10.0.0.0/8"],
+            vec!["in 0.0.0.0/0"],
+        );
+        let vm_ip = proxy.host.vm_ip;
+        let peer = Ipv4Address::new(10, 1, 2, 3);
+        let request = udp_packet(vm_ip, 40_000, peer, 1_234);
+        let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
+        assert!(proxy.allowed_from_vm_ipv4(request).is_some());
+
+        // An equivalent policy must preserve the tracked permission for this reply
+        let policy = proxy.policy_set(
+            vec!["out 10.0.0.0/8".parse().unwrap()],
+            vec!["in 0.0.0.0/0".parse().unwrap()],
+        );
+        assert_eq!(
+            policy,
+            Policy {
+                allow: vec!["out 10.0.0.0/8".parse().unwrap()],
+                block: vec!["in 0.0.0.0/0".parse().unwrap()],
+                rule_count: 2,
+            }
+        );
+
+        let reply = udp_packet(peer, 1_234, vm_ip, 40_000);
+        let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
+        assert!(proxy.allowed_from_host_ipv4(&reply).is_some());
+
+        // A changed policy clears tracked flows, so the inbound block applies again
+        proxy.policy_set(
+            vec!["out 10.1.0.0/16".parse().unwrap()],
+            vec!["in 0.0.0.0/0".parse().unwrap()],
+        );
+        assert!(proxy.allowed_from_host_ipv4(&reply).is_none());
+    }
+
+    fn create_proxy(allow: Vec<&str>, block: Vec<&str>) -> (Proxy, OwnedFd) {
+        let (vm_fd, peer) = socketpair(
             AddressFamily::Unix,
             SockType::Datagram,
             None,
             SockFlag::empty(),
         )
         .unwrap();
-        let vm_fd = Box::leak(Box::new(vm_fd));
-
-        Proxy::new(
-            vm_fd.as_raw_fd(),
-            MacAddress::from_str("02:00:00:00:00:02").unwrap(),
-            NetType::Nat,
+        let (_, vm_ip, subnet) = crate::subnet_finder::find_available_subnet(29).unwrap();
+        let vm_mac_address = MacAddress::from_str("02:00:00:00:00:02").unwrap();
+        let network =
+            crate::network::Network::new(NetType::Nat, subnet, &[(vm_mac_address, vm_ip)]).unwrap();
+        let proxy = Proxy::new(
+            VM::new(vm_fd.as_raw_fd()).unwrap(),
+            vm_mac_address,
+            vm_ip,
+            &network,
             allow
                 .into_iter()
                 .map(|value| value.parse().unwrap())
@@ -360,10 +457,11 @@ mod tests {
                 .into_iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
-            Vec::default(),
-            None,
+            Vec::new(),
         )
-        .unwrap()
+        .unwrap();
+
+        (proxy, peer)
     }
 
     fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {

@@ -1,15 +1,14 @@
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use clap::Parser;
 use log::LevelFilter;
 use oslog::OsLogger;
-use privdrop::PrivDrop;
 use softnet::NetType;
+use softnet::control::Control;
+use softnet::manager::{Manager, VmConfig};
 use softnet::proxy::ExposedPort;
-use softnet::proxy::Proxy;
 use softnet::proxy::Rule;
 use std::env;
 use std::os::raw::c_int;
-use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use system_configuration::core_foundation::base::TCFType;
@@ -36,21 +35,23 @@ struct Args {
     #[clap(
         long,
         value_parser = parse_vm_fd,
+        requires = "vm_mac_address",
+        required_unless_present = "control_fd",
         help = "FD number to use for communicating with the VM's networking stack"
     )]
-    vm_fd: c_int,
+    vm_fd: Option<c_int>,
 
     #[clap(
         long,
         value_parser = parse_vm_fd,
-        help = "connected Unix stream FD for newline-delimited JSON-RPC policy control"
+        help = "connected Unix stream FD for newline-delimited JSON-RPC control"
     )]
     control_fd: Option<c_int>,
 
-    #[clap(long, help = "MAC address to enforce for the VM")]
-    vm_mac_address: mac_address::MacAddress,
+    #[clap(long, requires = "vm_fd", help = "MAC address to enforce for the VM")]
+    vm_mac_address: Option<mac_address::MacAddress>,
 
-    #[clap(long, value_enum, help = "type of network to use for the VM", default_value_t=NetType::Nat)]
+    #[clap(long, requires = "vm_fd", value_enum, help = "type of network to use for the VM", default_value_t=NetType::Nat)]
     vm_net_type: NetType,
 
     #[clap(
@@ -68,6 +69,7 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "Comma-separated rules for allowing traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
         * in TARGET: flows initiated from TARGET to the VM\n\
@@ -93,6 +95,7 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "Comma-separated rules for blocking traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
         * in TARGET: flows initiated from TARGET to the VM\n\
@@ -116,6 +119,7 @@ struct Args {
 
     #[clap(
         long,
+        requires = "vm_fd",
         help = "comma-separated list of TCP ports to expose (e.g. --expose 2222:22,8080:80)",
         value_name = "comma-separated port specifications",
         use_value_delimiter = true,
@@ -168,7 +172,7 @@ fn main() -> ExitCode {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn try_main() -> anyhow::Result<()> {
     // Initialize logger
     OsLogger::new("org.cirruslabs.softnet")
@@ -221,33 +225,42 @@ async fn try_main() -> anyhow::Result<()> {
     // Configure bootpd(8) while still having the root privileges
     configure_bootpd(args.bootpd_lease_time)?;
 
-    // Initialize the proxy while still having the root privileges
-    let mut proxy = Proxy::new(
-        args.vm_fd as RawFd,
-        args.vm_mac_address,
-        args.vm_net_type,
-        args.allow,
-        args.block,
-        args.expose,
-        args.control_fd.map(|fd| fd as RawFd),
-    )
-    .context("failed to initialize proxy")?;
+    // Instantiate the manager with its control connection
+    let mut manager = Manager::new(
+        args.user.unwrap_or(current_user_name),
+        args.group.unwrap_or(current_group_name),
+        args.control_fd.map(Control::new).transpose()?,
+    );
 
-    // Drop effective privileges to the user
-    // and group which have had invoked us
-    PrivDrop::default()
-        .user(args.user.unwrap_or(current_user_name))
-        .group(args.group.unwrap_or(current_group_name))
-        .apply()
-        .context("failed to drop privileges")?;
-
-    // Run the proxy until it finishes or the process receives SIGINT
+    // Run the manager until it finishes or the process receives SIGINT
     let mut interrupt = signal(SignalKind::interrupt())?;
 
-    tokio::select! {
-        result = proxy.run() => result,
+    let result = tokio::select! {
+        result = async {
+            if let (Some(vm_fd), Some(vm_mac_address)) = (args.vm_fd, args.vm_mac_address) {
+                // Initialize the legacy single-VM path through the shared manager's batch operation
+                manager
+                    .initialize(
+                        args.vm_net_type,
+                        vec![VmConfig {
+                            vm_fd,
+                            vm_mac_address,
+                            allow: args.allow,
+                            block: args.block,
+                            exposed_ports: args.expose,
+                        }],
+                    )
+                    .await?;
+            }
+
+            manager.run().await
+        } => result,
         _ = interrupt.recv() => Ok(()),
-    }
+    };
+
+    let shutdown_result = manager.shutdown().await;
+
+    result.and(shutdown_result)
 }
 
 fn parse_vm_fd(value: &str) -> Result<c_int, String> {
