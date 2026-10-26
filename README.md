@@ -12,7 +12,7 @@ It is essentially a userspace packet filter which restricts the VM networking an
 
 In addition, Softnet tunes macOS built-in DHCP server to decrease its lease time from the default 86,400 seconds (one day) to 600 seconds (10 minutes). This is especially important when you use Tart to clone and run a lot of ephemeral VMs over a period of one day.
 
-Please check out [this blog post](https://cirrus-ci.org/blog/2022/07/07/isolating-network-between-tarts-macos-virtual-machines/) for backstory.
+Please check out [this blog post](https://medium.com/cirruslabs/isolating-network-between-tarts-macos-virtual-machines-9a4ae3dcf7be) for backstory.
 
 ## Working model
 
