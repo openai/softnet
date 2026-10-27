@@ -240,6 +240,8 @@ impl Manager {
         let (_, _, subnet) = subnet_finder::find_available_subnet(SUBNET_PREFIX_LEN)
             .context("failed to initialize proxy")
             .map_err(InitializationError::Rejected)?;
+
+        // Reserve the first usable address for the gateway
         let mut hosts = subnet.hosts().skip(1);
         let mut configured = Vec::with_capacity(vms.len());
         let mut initialized = Vec::with_capacity(vms.len());
