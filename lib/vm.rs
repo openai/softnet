@@ -37,6 +37,23 @@ impl VM {
             .await
     }
 
+    pub fn is_disconnect(&self, error: &io::Error) -> io::Result<bool> {
+        // Confirm peer closure after an explicit connection error
+        if matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+        ) {
+            return Ok(!self.is_connected()?);
+        }
+
+        // A prior write may consume the reset, leaving later sends without a destination
+        if let Some(libc::EDESTADDRREQ) = error.raw_os_error() {
+            return Ok(!self.is_connected()?);
+        }
+
+        Ok(false)
+    }
+
     pub fn is_connected(&self) -> io::Result<bool> {
         match self.sock.get_ref().peer_addr() {
             Ok(_) => Ok(true),

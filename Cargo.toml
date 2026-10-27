@@ -14,22 +14,23 @@ debug = true
 [dependencies]
 smoltcp = "0"
 libc = "0"
-tokio = { version = "1", features = ["rt", "sync", "net", "signal", "time", "macros", "io-util"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal", "time", "macros", "io-util"] }
+tokio-util = { version = "0.7.19", features = ["join-map", "codec"] }
 bytes = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 dhcproto = { git = "https://github.com/bluecatengineering/dhcproto.git", branch = "master" }
-vmnet = "0.7.0"
+vmnet = "0.9.0"
 clap = { version = "4", features = ["derive"] }
 mac_address = "1"
 privdrop = "0"
 anyhow = { version = "1", features = ["backtrace"] }
+thiserror = "2"
 ip_network = "0"
 uzers = "0"
 system-configuration = "0"
 sentry = { version = "0", features = ["debug-images"] }
 sentry-anyhow = { version = "0", features = ["backtrace"] }
-nix = { version = "0", features = ["socket"] }
+nix = { version = "0", features = ["fs", "socket"] }
 network-interface = "2"
 prefix-trie = "0"
 ipnet = "2"
@@ -41,6 +42,8 @@ coarsetime = "0.1.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonrpsee-types = "0.26"
+uuid = { version = "1", features = ["v7"] }
+unix-ancillary = { version = "0.6.1", features = ["tokio"] }
 
 [profile.release]
 debug = true

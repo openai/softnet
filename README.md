@@ -23,7 +23,7 @@ Softnet solves two problems:
 2. DHCP exhaustion
     * macOS built-in DHCP-server allocates a `/24` subnet with 86400 seconds lease time by default, which only allows for ~253 VMs a day (or 1 VM every ~6 minutes) to be spawned without causing a denial-of-service, which is pretty limiting for CI services like Cirrus CI
 
-Each VM gets a separate [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/29` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for the VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
+Up to five VMs in one Softnet process share a [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/29` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for each VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
 
 ### Stateful flow authorization
 
@@ -68,18 +68,45 @@ For proper functioning, Softnet binary requires two things:
 
 Softnet is started and managed automatically by Tart if `--net-softnet` flag is provided when calling `tart run`.
 
-### Dynamic network policy
+Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The control socket is duplex and must be separate from the sockets carrying VM packets.
 
-Softnet can update the running VM's IPv4 policy without restarting the VM. Pass a connected Unix stream socket as `--control-fd` to enable a newline-delimited [JSON-RPC 2.0](https://www.jsonrpc.org/specification) control channel. The socket is duplex and must be separate from `--vm-fd`, which carries VM packets.
+Every request must include a non-null string or non-negative integer `id`; notifications are rejected so requests always have an acknowledgment. A request frame may not exceed 1 MiB.
 
-The supported methods are `softnet.policy.get` and `softnet.policy.set`. A complete policy update looks like this (each request and response occupies one line):
+### VM initialization
+
+Softnet can start with just `--control-fd` and create VMs through RPC.
+
+`softnet.initialize` accepts `vmNetType` (`"nat"` or `"host"`, default `"nat"`) and a `vms` array containing one to five VMs. Each VM requires a distinct `vmMacAddress` and accepts optional `allow`, `block`, and `expose` arrays, which default to empty. Rules and exposed TCP ports use the same syntax as the corresponding CLI arguments.
+
+Attach exactly one VM socket descriptor per entry through `SCM_RIGHTS` to the first byte of the request frame, in the same order as `vms`. Keep the sender's descriptors open until the initialization response arrives.
+
+A successful response contains a `vms` array in request order; each entry includes a UUID string `vmId` and the corresponding `vmMacAddress`. Initialization drops privileges before responding.
+
+With two attached VM socket descriptors, a request and response look like this (each occupies one line; VM IDs are illustrative):
 
 ```json
-{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
+{"jsonrpc":"2.0","id":"42","method":"softnet.initialize","params":{"vmNetType":"nat","vms":[{"vmMacAddress":"02:00:00:00:00:02","allow":["@host"]},{"vmMacAddress":"02:00:00:00:00:03"}]}}
+{"jsonrpc":"2.0","id":"42","result":{"vms":[{"vmId":"019a1b2c-3d4e-7000-8000-000000000001","vmMacAddress":"02:00:00:00:00:02"},{"vmId":"019a1b2c-3d4e-7000-8000-000000000002","vmMacAddress":"02:00:00:00:00:03"}]}}
+```
+
+Each Softnet process initializes once with the complete VM list; VMs cannot be added later. Initialization is all-or-nothing: no VM begins forwarding until every VM is configured and privileges have been dropped successfully. Validation errors reject the entire batch and allow retry; native setup or privilege dropping failures clean up the entire batch and terminate Softnet without returning partial success.
+
+Softnet exits when the last VM disconnects, even if the control socket remains open.
+
+The `--vm-fd` and `--vm-mac-address` arguments still initialize a single VM.
+
+### Dynamic network policy
+
+Softnet can update the running VM's IPv4 policy without restarting the VM.
+
+The supported methods are `softnet.policy.get` and `softnet.policy.set`. Both accept an optional `vmId`, which can be omitted only when the process was initialized with exactly one VM. Multi-VM batches always require `vmId`, even after all but one VM disconnects. A complete policy update looks like this (each request and response occupies one line):
+
+```json
+{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"vmId":"019a1b2c-3d4e-7000-8000-000000000001","allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
 {"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
 ```
 
-Every request must include a non-null string (at most 256 bytes) or non-negative integer `id`; notifications are rejected so policy changes always have an acknowledgment. Policy updates are atomic: all rules are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical rules are preserved. Rules are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block rules, and a request frame may not exceed 1 MiB.
+Policy updates are atomic: all rules are parsed and a new prefix map is built before the active policy changes. Longest-prefix matching and block precedence for identical rules are preserved. Rules are normalized and deduplicated. A policy update may contain at most 4096 combined allow/block rules.
 
 When the normalized allow or block policy changes, Softnet clears the flow table so the new policy applies to established flows immediately. This may interrupt active connections. Repeating the same normalized policy is a no-op and preserves the flow table.
 
