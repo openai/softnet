@@ -156,7 +156,7 @@ impl Control {
     }
 
     /// Validates a frame and returns its request or a complete error response
-    pub(crate) fn parse(frame: Frame) -> std::result::Result<(Id<'static>, Request), Value> {
+    fn parse(frame: Frame) -> std::result::Result<(Id<'static>, Request), Value> {
         let Frame { line, mut fds } = frame;
 
         // Use a null response ID for framing errors because the request has not been parsed
