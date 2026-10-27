@@ -89,7 +89,9 @@ With two attached VM socket descriptors, a request and response look like this (
 {"jsonrpc":"2.0","id":"42","result":{"vms":[{"vmId":"019a1b2c-3d4e-7000-8000-000000000001","vmMacAddress":"02:00:00:00:00:02"},{"vmId":"019a1b2c-3d4e-7000-8000-000000000002","vmMacAddress":"02:00:00:00:00:03"}]}}
 ```
 
-Each Softnet process initializes once with the complete VM list; VMs cannot be added later. Validation errors allow retry; native setup or privilege dropping failures terminate Softnet. Softnet exits when the last VM disconnects, even if the control socket remains open.
+Each Softnet process initializes once with the complete VM list; VMs cannot be added later. Initialization is all-or-nothing: no VM begins forwarding until every VM is configured and privileges have been dropped successfully. Validation errors reject the entire batch and allow retry; native setup or privilege dropping failures clean up the entire batch and terminate Softnet without returning partial success.
+
+Softnet exits when the last VM disconnects, even if the control socket remains open.
 
 The `--vm-fd` and `--vm-mac-address` arguments still initialize a single VM.
 
