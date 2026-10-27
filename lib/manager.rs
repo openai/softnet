@@ -1,6 +1,6 @@
 use crate::control::Control;
 use crate::dhcp_server::DHCP_SERVER_MAC;
-use crate::network::{MAX_VMS, NetType, Network};
+use crate::network::{MAX_VMS, NetType, Network, SUBNET_PREFIX_LEN};
 use crate::proxy::{Command, ExposedPort, Policy, Proxy, Rule};
 use crate::subnet_finder;
 use crate::vm::VM;
@@ -236,8 +236,8 @@ impl Manager {
             }
         }
 
-        // Find an unused /29 subnet for the gateway and VMs
-        let (_, _, subnet) = subnet_finder::find_available_subnet(29)
+        // Find an unused subnet for the gateway and VMs
+        let (_, _, subnet) = subnet_finder::find_available_subnet(SUBNET_PREFIX_LEN)
             .context("failed to initialize proxy")
             .map_err(InitializationError::Rejected)?;
         let mut hosts = subnet.hosts().skip(1);

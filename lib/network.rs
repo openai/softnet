@@ -9,6 +9,9 @@ use vmnet::network::Mode;
 // A /29 has six usable addresses, including the gateway
 pub(crate) const MAX_VMS: usize = 5;
 
+// Prefix length of a subnet used by one or more VMs
+pub(crate) const SUBNET_PREFIX_LEN: u8 = 29;
+
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
 pub enum NetType {
     /// Shared network
