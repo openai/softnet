@@ -26,19 +26,29 @@ pub struct Control {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct InitializeParams {
+    // Shared network mode for all VMs: "nat" by default, or "host"
     #[serde(default)]
     vm_net_type: Option<String>,
+
+    // Complete VM batch, ordered to match the attached SCM_RIGHTS descriptors
     vms: Vec<VmParams>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct VmParams {
+    // Unique MAC address used by this VM
     vm_mac_address: String,
+
+    // Initial packet filter allow rules
     #[serde(default)]
     allow: Vec<String>,
+
+    // Initial packet filter block rules
     #[serde(default)]
     block: Vec<String>,
+
+    // TCP port-forwarding mappings in EXTERNAL:INTERNAL form
     #[serde(default)]
     expose: Vec<String>,
 }
@@ -46,15 +56,21 @@ struct VmParams {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 struct GetParams {
+    // Target VM UUID; omission is allowed only for a single-VM initialization
     vm_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SetParams {
+    // Target VM UUID; omission is allowed only for a single-VM initialization
     #[serde(default)]
     vm_id: Option<String>,
+
+    // Complete replacement for the VM's packet filter allow rules
     allow: Vec<String>,
+
+    // Complete replacement for the VM's packet filter block rules
     block: Vec<String>,
 }
 
