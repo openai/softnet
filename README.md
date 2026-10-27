@@ -100,7 +100,7 @@ Softnet can update the running VM's IPv4 policy without restarting the VM.
 The supported methods are `softnet.policy.get` and `softnet.policy.set`. Both accept an optional `vmId`, which can be omitted only when the process was initialized with exactly one VM. Multi-VM batches always require `vmId`, even after all but one VM disconnects. A complete policy update looks like this (each request and response occupies one line):
 
 ```json
-{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
+{"jsonrpc":"2.0","id":"42","method":"softnet.policy.set","params":{"vmId":"019a1b2c-3d4e-7000-8000-000000000001","allow":["@host","10.0.0.0/8"],"block":["0.0.0.0/0"]}}
 {"jsonrpc":"2.0","id":"42","result":{"allow":["10.0.0.0/8","@host"],"block":["0.0.0.0/0"],"ruleCount":3}}
 ```
 
