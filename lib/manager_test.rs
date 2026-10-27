@@ -5,7 +5,7 @@ use crate::proxy::{Command, Policy};
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, INVALID_PARAMS_CODE};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, IntoRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -72,7 +72,7 @@ async fn canceling_run_then_shutdown_stops_an_idle_manager() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(socket.into_raw_fd()).unwrap()),
+        Some(Control::new(socket.into()).unwrap()),
     );
 
     // Poll the manager once before cancelling its idle run
@@ -317,7 +317,7 @@ async fn control_only_waits_until_eof() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(socket.into_raw_fd()).unwrap()),
+        Some(Control::new(socket.into()).unwrap()),
     );
     peer.set_nonblocking(true).unwrap();
     let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
@@ -346,7 +346,7 @@ async fn last_vm_completion_closes_connected_control() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(socket.into_raw_fd()).unwrap()),
+        Some(Control::new(socket.into()).unwrap()),
     );
     manager.initialized = true;
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -388,7 +388,7 @@ async fn control_disconnect_keeps_active_vm_supervised() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(socket.into_raw_fd()).unwrap()),
+        Some(Control::new(socket.into()).unwrap()),
     );
     manager.initialized = true;
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -547,7 +547,7 @@ async fn shutdown_closes_control_with_an_unanswered_request() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(socket.into_raw_fd()).unwrap()),
+        Some(Control::new(socket.into()).unwrap()),
     );
     peer.set_nonblocking(true).unwrap();
     let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
@@ -647,7 +647,7 @@ async fn rejected_rpc_initialization_keeps_control_available() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(control_socket.into_raw_fd()).unwrap()),
+        Some(Control::new(control_socket.into()).unwrap()),
     );
     let (first_socket, _first_peer) = UnixDatagram::pair().unwrap();
     let (second_socket, _second_peer) = UnixDatagram::pair().unwrap();
@@ -706,7 +706,7 @@ async fn policy_requests_before_initialization_reject_missing_vms() {
     let mut manager = Manager::new(
         "unused".into(),
         "unused".into(),
-        Some(Control::new(control_socket.into_raw_fd()).unwrap()),
+        Some(Control::new(control_socket.into()).unwrap()),
     );
     control_peer.set_nonblocking(true).unwrap();
     let mut peer = BufReader::new(tokio::net::UnixStream::from_std(control_peer).unwrap());
@@ -770,7 +770,7 @@ async fn native_vm_disconnect_ends_run() {
 #[serial_test::serial]
 async fn native_control_disconnect_keeps_vms_running() {
     let (control_socket, control_peer) = UnixStream::pair().unwrap();
-    let mut manager = native_manager(Some(Control::new(control_socket.into_raw_fd()).unwrap()));
+    let mut manager = native_manager(Some(Control::new(control_socket.into()).unwrap()));
     let (socket, peer) = UnixDatagram::pair().unwrap();
     timeout(
         TIMEOUT,
@@ -797,7 +797,7 @@ async fn native_control_disconnect_keeps_vms_running() {
 #[serial_test::serial]
 async fn native_batch_rpc_preserves_order_and_independent_policies() {
     let (control_socket, control_peer) = UnixStream::pair().unwrap();
-    let mut manager = native_manager(Some(Control::new(control_socket.into_raw_fd()).unwrap()));
+    let mut manager = native_manager(Some(Control::new(control_socket.into()).unwrap()));
     let (first_socket, first_peer) = UnixDatagram::pair().unwrap();
     let (second_socket, second_peer) = UnixDatagram::pair().unwrap();
 
@@ -1024,7 +1024,7 @@ async fn native_initialization_failure_flushes_its_rpc_reply() {
     let mut manager = Manager::new(
         "softnet-test-nonexistent-user".into(),
         group.name().to_string_lossy().into_owned(),
-        Some(Control::new(control_socket.into_raw_fd()).unwrap()),
+        Some(Control::new(control_socket.into()).unwrap()),
     );
     let (socket, peer) = UnixDatagram::pair().unwrap();
     let request = json!({
@@ -1092,7 +1092,7 @@ async fn native_initialize_drops_credentials_and_rejects_reinitialization() {
     let mut manager = Manager::new(
         user.name().to_str().unwrap().into(),
         group.name().to_str().unwrap().into(),
-        Some(Control::new(control_socket.into_raw_fd()).unwrap()),
+        Some(Control::new(control_socket.into()).unwrap()),
     );
     let (socket, vm_peer) = UnixDatagram::pair().unwrap();
     let request = json!({

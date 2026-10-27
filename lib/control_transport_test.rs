@@ -1,14 +1,13 @@
 use super::{ControlTransport, MAX_FRAME_FDS, MAX_REQUEST_BYTES, READ_BUFFER_BYTES};
 use futures_util::FutureExt;
 use std::io::{Read, Write};
-use std::os::fd::IntoRawFd;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use tokio::io::AsyncWriteExt;
 use unix_ancillary::{AsyncUnixStreamExt, UnixStreamExt};
 
 fn socket_pair() -> (ControlTransport, UnixStream) {
     let (socket, peer) = UnixStream::pair().unwrap();
-    let control = ControlTransport::new(socket.into_raw_fd()).unwrap();
+    let control = ControlTransport::new(socket.into()).unwrap();
 
     (control, peer)
 }
@@ -205,26 +204,24 @@ async fn excessive_attachments_close_every_descriptor_without_kernel_truncation(
 #[tokio::test]
 async fn validates_owned_descriptor_and_signals_eof_on_drop() {
     let file = std::fs::File::open("/dev/null").unwrap();
-    assert!(ControlTransport::new(file.into_raw_fd()).is_err());
+    assert!(ControlTransport::new(file.into()).is_err());
 
     let (datagram, peer) = UnixDatagram::pair().unwrap();
-    assert!(ControlTransport::new(datagram.into_raw_fd()).is_err());
+    assert!(ControlTransport::new(datagram.into()).is_err());
     assert!(peer.send(&[0]).is_err());
 
     // A connected TCP stream passes the type check but must fail Unix address validation
     let internet_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let internet = std::net::TcpStream::connect(internet_listener.local_addr().unwrap()).unwrap();
-    assert!(ControlTransport::new(internet.into_raw_fd()).is_err());
+    assert!(ControlTransport::new(internet.into()).is_err());
 
     let path = std::env::temp_dir().join(format!("softnet-control-{}.sock", std::process::id()));
     let listener = UnixListener::bind(&path).unwrap();
-    assert!(ControlTransport::new(listener.into_raw_fd()).is_err());
+    assert!(ControlTransport::new(listener.into()).is_err());
     std::fs::remove_file(path).unwrap();
 
-    assert!(ControlTransport::new(-1).is_err());
-
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let control = ControlTransport::new(socket.into_raw_fd()).unwrap();
+    let control = ControlTransport::new(socket.into()).unwrap();
     drop(control);
 
     assert_peer_closed(&mut peer);

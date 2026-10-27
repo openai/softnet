@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use nix::sys::socket::{SockType, getsockopt, sockopt};
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -26,14 +26,8 @@ pub(crate) struct Frame {
 }
 
 impl ControlTransport {
-    pub(crate) fn new(control_fd: RawFd) -> Result<Self> {
-        // SAFETY: fcntl checks whether the descriptor is open before taking ownership
-        if unsafe { libc::fcntl(control_fd, libc::F_GETFD) } == -1 {
-            return Err(io::Error::last_os_error()).context("invalid control file descriptor");
-        }
-
-        // SAFETY: fcntl verified the descriptor is open, so we transfer the ownership
-        let stream = unsafe { StdUnixStream::from_raw_fd(control_fd) };
+    pub(crate) fn new(control_fd: OwnedFd) -> Result<Self> {
+        let stream = StdUnixStream::from(control_fd);
 
         // Validate the inherited socket before registering it with Tokio
         let socket_type = getsockopt(&stream, sockopt::SockType)

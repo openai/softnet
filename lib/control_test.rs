@@ -8,7 +8,7 @@ use jsonrpsee_types::error::{
 };
 use serde_json::{Value, json};
 use std::io::Read;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixDatagram, UnixStream as StdUnixStream};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -20,7 +20,7 @@ use unix_ancillary::AsyncUnixStreamExt;
 use uuid::Uuid;
 
 fn start_control(socket: UnixStream) -> (JoinHandle<()>, mpsc::Receiver<Call>) {
-    let control = Control::new(socket.into_std().unwrap().into_raw_fd()).unwrap();
+    let control = Control::new(socket.into_std().unwrap().into()).unwrap();
     let (control_calls_tx, control_calls_rx) = mpsc::channel(1);
     let task = tokio::spawn(async move {
         timeout(Duration::from_secs(5), control.run(control_calls_tx))

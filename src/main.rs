@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use clap::Parser;
 use log::LevelFilter;
 use oslog::OsLogger;
@@ -8,6 +8,7 @@ use softnet::manager::{Manager, VmConfig};
 use softnet::proxy::ExposedPort;
 use softnet::proxy::Rule;
 use std::env;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::raw::c_int;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
@@ -225,11 +226,26 @@ async fn try_main() -> anyhow::Result<()> {
     // Configure bootpd(8) while still having the root privileges
     configure_bootpd(args.bootpd_lease_time)?;
 
+    // Take ownership of the control descriptor inherited from the parent process
+    let control = args
+        .control_fd
+        .map(|control_fd| {
+            // SAFETY: fcntl checks whether the descriptor is open before taking ownership
+            if unsafe { libc::fcntl(control_fd, libc::F_GETFD) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("invalid control file descriptor");
+            }
+
+            // SAFETY: fcntl verified the descriptor is open, so we transfer the ownership
+            Control::new(unsafe { OwnedFd::from_raw_fd(control_fd) })
+        })
+        .transpose()?;
+
     // Instantiate the manager with its control connection
     let mut manager = Manager::new(
         args.user.unwrap_or(current_user_name),
         args.group.unwrap_or(current_group_name),
-        args.control_fd.map(Control::new).transpose()?,
+        control,
     );
 
     // Run the manager until it finishes or the process receives SIGINT

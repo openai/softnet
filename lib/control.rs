@@ -13,7 +13,7 @@ use jsonrpsee_types::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ struct SetParams {
 }
 
 impl Control {
-    pub fn new(control_fd: RawFd) -> Result<Self> {
+    pub fn new(control_fd: OwnedFd) -> Result<Self> {
         Ok(Self {
             transport: ControlTransport::new(control_fd)?,
         })
