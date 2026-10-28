@@ -295,7 +295,13 @@ impl Manager {
                 .iter()
                 .map(|(_, config, vm_ip, _)| (config.vm_mac_address, *vm_ip))
                 .collect();
-            let network = Network::new(vm_net_type, subnet, &reservations)?;
+            let port_forwardings: Vec<_> = configured
+                .iter()
+                .flat_map(|(_, config, vm_ip, _)| {
+                    config.exposed_ports.iter().map(|port| (*vm_ip, *port))
+                })
+                .collect();
+            let network = Network::new(vm_net_type, subnet, &reservations, &port_forwardings)?;
             let mut proxies = Vec::with_capacity(configured.len());
 
             // Finish the entire batch before giving a proxy to any VM task
@@ -307,7 +313,6 @@ impl Manager {
                     &network,
                     config.allow,
                     config.block,
-                    config.exposed_ports,
                 )
                 .with_context(|| format!("failed to initialize VM at index {index} ({vm_id})"))?;
                 proxies.push(proxy);

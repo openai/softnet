@@ -768,6 +768,29 @@ async fn native_vm_disconnect_ends_run() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn native_batch_exposes_ports_for_every_vm() {
+    let mut manager = native_manager(None);
+    let (socket, _peer) = UnixDatagram::pair().unwrap();
+    let mut first = vm_config(&socket, "02:00:00:00:00:02");
+    first.exposed_ports = vec!["52222:22".parse().unwrap()];
+    let mut second = vm_config(&socket, "02:00:00:00:00:03");
+    second.exposed_ports = vec!["52223:22".parse().unwrap(), "58080:80".parse().unwrap()];
+    drop(socket);
+
+    // Every VM's forwards are added to the shared network before it starts
+    timeout(
+        TIMEOUT,
+        manager.initialize(NetType::Nat, vec![first, second]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    timeout(TIMEOUT, manager.shutdown()).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn native_control_disconnect_keeps_vms_running() {
     let (control_socket, control_peer) = UnixStream::pair().unwrap();
     let mut manager = native_manager(Some(Control::new(control_socket.into()).unwrap()));

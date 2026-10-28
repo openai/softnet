@@ -1,10 +1,13 @@
+use crate::proxy::ExposedPort;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use ipnet::Ipv4Net;
+use log::info;
 use mac_address::MacAddress;
 use std::net::Ipv4Addr;
 use vmnet::NetworkConfiguration;
 use vmnet::network::Mode;
+use vmnet::port_forwarding::{AddressFamily, Protocol};
 
 // A /29 has six usable addresses, including the gateway
 pub(crate) const MAX_VMS: usize = 5;
@@ -35,6 +38,7 @@ impl Network {
         net_type: NetType,
         subnet: Ipv4Net,
         reservations: &[(MacAddress, Ipv4Addr)],
+        port_forwardings: &[(Ipv4Addr, ExposedPort)],
     ) -> Result<Self> {
         // Create vmnet's network configuration
         let mut configuration = NetworkConfiguration::new(match net_type {
@@ -62,9 +66,37 @@ impl Network {
                 })?;
         }
 
+        // Forward exposed ports to the reserved VM addresses, which vmnet only
+        // accepts on the configuration, before the network is created
+        let port_forwardings = port_forwardings
+            .iter()
+            .map(|(vm_ip, port)| {
+                let details = format!(
+                    "external_port={}, internal_addr={vm_ip}, internal_port={}",
+                    port.external_port, port.internal_port
+                );
+
+                configuration
+                    .add_port_forwarding_rule(
+                        AddressFamily::Ipv4,
+                        Protocol::Tcp,
+                        port.external_port,
+                        (*vm_ip).into(),
+                        port.internal_port,
+                    )
+                    .with_context(|| format!("failed to add port forwarding rule {details}"))?;
+
+                Ok(details)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         // Create vmnet's network
         let handle = vmnet::Network::new(&configuration)
             .with_context(|| format!("failed to create vmnet network {subnet}"))?;
+
+        for details in port_forwardings {
+            info!("added port forwarding rule {details}");
+        }
 
         Ok(Self {
             handle,

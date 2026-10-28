@@ -2909,9 +2909,9 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vmnet"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf185ef14ad566190dfcc44151e1e97864f5528ce478ac497910bc9f4bfd58d"
+checksum = "971ab27d91ac0f6573c40436b4b3bca046bfd9ee84efa5e2c416be50847d936b"
 dependencies = [
  "bitflags 2.13.2",
  "block2",
@@ -2931,9 +2931,9 @@ dependencies = [
 
 [[package]]
 name = "vmnet-derive"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c326cc79bf3790485d9c4def530d9b35d2fceb6cd7b189a12d1476fd2206b9f"
+checksum = "5f420509568a7eccdf21fe64b5a7635f4f8b0e871d7d735df406ebbc24df99c1"
 dependencies = [
  "darling",
  "proc-macro2",

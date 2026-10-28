@@ -19,7 +19,7 @@ tokio-util = { version = "0.7.19", features = ["join-map", "codec"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 dhcproto = { git = "https://github.com/bluecatengineering/dhcproto.git", branch = "master" }
-vmnet = "0.9.0"
+vmnet = "0.10.0"
 clap = { version = "4", features = ["derive"] }
 mac_address = "1"
 privdrop = "0"
