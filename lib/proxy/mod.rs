@@ -65,6 +65,7 @@ impl Proxy {
         network: &Network,
         allow: Vec<Rule>,
         block: Vec<Rule>,
+        dns_server: Option<Arc<DnsServer>>,
     ) -> Result<Proxy> {
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
         let allow = normalize_rules(allow);
@@ -89,6 +90,7 @@ impl Proxy {
             host.vm_ip,
             network.subnet.netmask(),
             host.gateway_ip,
+            dns_server.iter().map(|server| server.domain()).collect(),
         );
 
         Ok(Proxy {
@@ -96,18 +98,13 @@ impl Proxy {
             host,
             vm_mac_address,
             dhcp_server,
-            dns_server: None,
+            dns_server,
             rules,
             allow,
             block,
             flows,
             enobufs_encountered: false,
         })
-    }
-
-    pub(crate) fn set_dns_server(&mut self, dns_server: Arc<DnsServer>) {
-        let dns_server = self.dns_server.insert(dns_server);
-        self.dhcp_server.search_domains = vec![dns_server.domain()];
     }
 
     pub(crate) async fn run(&mut self, mut commands_rx: mpsc::Receiver<Command>) -> Result<()> {
@@ -509,6 +506,7 @@ mod tests {
                 .into_iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
+            None,
         )
         .unwrap();
 

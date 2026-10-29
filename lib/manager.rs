@@ -330,19 +330,16 @@ impl Manager {
 
             // Finish the entire batch before giving a proxy to any VM task
             for (index, (vm, config, vm_ip, vm_id)) in configured.into_iter().enumerate() {
-                let mut proxy = Proxy::new(
+                let proxy = Proxy::new(
                     vm,
                     config.vm_mac_address,
                     vm_ip,
                     &network,
                     config.allow,
                     config.block,
+                    dns_server.clone(),
                 )
                 .with_context(|| format!("failed to initialize VM at index {index} ({vm_id})"))?;
-
-                if let Some(dns_server) = &dns_server {
-                    proxy.set_dns_server(dns_server.clone());
-                }
 
                 proxies.push(proxy);
             }

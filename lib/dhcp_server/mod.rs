@@ -16,7 +16,7 @@ pub(crate) struct DhcpServer {
     vm_ip: Ipv4Address,
     subnet_mask: Ipv4Address,
     gateway_ip: Ipv4Address,
-    pub(crate) search_domains: Vec<Name>,
+    search_domains: Vec<Name>,
 }
 
 impl DhcpServer {
@@ -26,13 +26,14 @@ impl DhcpServer {
         vm_ip: Ipv4Address,
         subnet_mask: Ipv4Address,
         gateway_ip: Ipv4Address,
+        search_domains: Vec<Name>,
     ) -> Self {
         Self {
             vm_mac,
             vm_ip,
             subnet_mask,
             gateway_ip,
-            search_domains: Vec::new(),
+            search_domains,
         }
     }
 
@@ -282,7 +283,7 @@ mod tests {
     #[test]
     fn assigns_reserved_address() {
         // Create a server and a client request
-        let dhcp = DhcpServer::new(VM, ADDRESS, MASK, GATEWAY);
+        let dhcp = DhcpServer::new(VM, ADDRESS, MASK, GATEWAY, Vec::new());
         let mut message = request(MessageType::Discover);
 
         // Discover the reserved address
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn renews_reserved_address_and_rejects_stale_address() {
         // Renew the reserved address
-        let dhcp = DhcpServer::new(VM, ADDRESS, MASK, GATEWAY);
+        let dhcp = DhcpServer::new(VM, ADDRESS, MASK, GATEWAY, Vec::new());
         let mut message = request(MessageType::Request);
         message.set_ciaddr(ADDRESS);
         let (ack, destination) = exchange(&dhcp, &message, GATEWAY);
