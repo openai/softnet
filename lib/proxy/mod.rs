@@ -9,7 +9,7 @@ use crate::dhcp_server::DhcpServer;
 use crate::host::Host;
 use crate::network::Network;
 use crate::vm::VM;
-use anyhow::{Context, Result};
+use anyhow::Result;
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
 use ipnet::Ipv4Net;
@@ -62,14 +62,13 @@ impl Proxy {
         network: &Network,
         allow: Vec<Rule>,
         block: Vec<Rule>,
-        exposed_ports: Vec<ExposedPort>,
     ) -> Result<Proxy> {
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
         let allow = normalize_rules(allow);
         let block = normalize_rules(block);
 
         // Create this VM's vmnet interface on the shared network
-        let mut host = Host::new(
+        let host = Host::new(
             network,
             vm_ip,
             !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
@@ -88,12 +87,6 @@ impl Proxy {
             network.subnet.netmask(),
             host.gateway_ip,
         );
-
-        // Install port forwardings for the VM's reserved IP address
-        for port in exposed_ports {
-            host.port_forwarding_add_rule(port.external_port, host.vm_ip, port.internal_port)
-                .context("failed to configure port forwarding")?;
-        }
 
         Ok(Proxy {
             vm,
@@ -443,7 +436,8 @@ mod tests {
         let (_, vm_ip, subnet) = crate::subnet_finder::find_available_subnet(29).unwrap();
         let vm_mac_address = MacAddress::from_str("02:00:00:00:00:02").unwrap();
         let network =
-            crate::network::Network::new(NetType::Nat, subnet, &[(vm_mac_address, vm_ip)]).unwrap();
+            crate::network::Network::new(NetType::Nat, subnet, &[(vm_mac_address, vm_ip)], &[])
+                .unwrap();
         let proxy = Proxy::new(
             VM::new(vm_fd.as_raw_fd()).unwrap(),
             vm_mac_address,
@@ -457,7 +451,6 @@ mod tests {
                 .into_iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
-            Vec::new(),
         )
         .unwrap();
 

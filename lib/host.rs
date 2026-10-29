@@ -1,12 +1,10 @@
 use crate::network::Network;
 use anyhow::{Context, Result, anyhow};
-use log::info;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use tokio::sync::Notify;
 use vmnet::parameters::{Parameter, ParameterKind};
-use vmnet::port_forwarding::{AddressFamily, Protocol};
 use vmnet::{Batch, Events, Options};
 
 pub struct Host {
@@ -84,28 +82,6 @@ impl Host {
 }
 
 impl Host {
-    pub fn port_forwarding_add_rule(
-        &mut self,
-        external_port: u16,
-        internal_addr: Ipv4Addr,
-        internal_port: u16,
-    ) -> Result<()> {
-        let details = format!(
-            "external_port={external_port}, internal_addr={internal_addr}, internal_port={internal_port}"
-        );
-
-        self.interface
-            .port_forwarding_rule_add(
-                AddressFamily::Ipv4,
-                Protocol::Tcp,
-                external_port,
-                internal_addr.into(),
-                internal_port,
-            )
-            .map(|_| info!("added port forwarding rule {details}"))
-            .map_err(|err| anyhow!("failed to add port forwarding rule {details}: {err}"))
-    }
-
     pub async fn read(&mut self, batch: &mut Batch, bufs: &mut [Vec<u8>]) -> vmnet::Result<usize> {
         loop {
             // One callback can cover several batches; stay ready until an empty read
