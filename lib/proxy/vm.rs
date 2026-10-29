@@ -1,3 +1,4 @@
+use crate::dns_server::DNS_PORT;
 use crate::proxy::flows::{FlowDirection, FlowMatch};
 use crate::proxy::{Direction, PolicyDecision, Proxy};
 use anyhow::Context;
@@ -5,15 +6,18 @@ use anyhow::Result;
 use dhcproto::v4::SERVER_PORT;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
-    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address,
-    Ipv4Packet, Ipv4Repr, UdpPacket,
+    ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
+    IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, UdpPacket,
 };
 
 const IPV4_HEADER_LEN_WITHOUT_OPTIONS: u8 = 20;
 
 impl Proxy {
-    pub(crate) fn process_frame_from_vm(&mut self, frame: EthernetFrame<&[u8]>) -> Result<()> {
-        if self.allowed_from_vm(&frame).is_none() {
+    pub(crate) async fn process_frame_from_vm(
+        &mut self,
+        frame: EthernetFrame<&[u8]>,
+    ) -> Result<()> {
+        if self.allowed_from_vm(&frame).await.is_none() {
             // Block packet by not forwarding it to the host
             return Ok(());
         }
@@ -24,7 +28,7 @@ impl Proxy {
             .context("failed to write to the host")
     }
 
-    fn allowed_from_vm(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
+    async fn allowed_from_vm(&mut self, frame: &EthernetFrame<&[u8]>) -> Option<()> {
         if frame.src_addr() != self.vm_mac_address {
             return None;
         }
@@ -43,7 +47,7 @@ impl Proxy {
                     return None;
                 }
 
-                self.allowed_from_vm_ipv4(ipv4_pkt)
+                self.allowed_from_vm_ipv4(frame.dst_addr(), ipv4_pkt).await
             }
             _ => None,
         }
@@ -53,7 +57,11 @@ impl Proxy {
         vm_arp_allowed(arp_pkt, self.vm_mac_address, self.host.vm_ip)
     }
 
-    pub(crate) fn allowed_from_vm_ipv4(&mut self, ipv4_pkt: Ipv4Packet<&[u8]>) -> Option<()> {
+    pub(crate) async fn allowed_from_vm_ipv4(
+        &mut self,
+        destination_mac: EthernetAddress,
+        ipv4_pkt: Ipv4Packet<&[u8]>,
+    ) -> Option<()> {
         // Consume DHCP before enforcing the reserved source address
         if self.consume_dhcp(&ipv4_pkt) {
             return None;
@@ -61,6 +69,11 @@ impl Proxy {
 
         // Is this packet coming from the VM's reserved IP address?
         if self.host.vm_ip == ipv4_pkt.src_addr() {
+            // Answer queries for Softnet's DNS zone locally
+            if self.consume_dns(destination_mac, &ipv4_pkt).await {
+                return None;
+            }
+
             // Consult the flow table before evaluating outbound policy
             // so established flows are not treated as new traffic
             let pending = match self
@@ -136,6 +149,72 @@ impl Proxy {
         if let Err(err) = result {
             sentry::capture_message(
                 &format!("Failed to reply to DHCP request: {err:#}"),
+                sentry::Level::Warning,
+            );
+        }
+
+        // Consume the packet even if the request was rejected or the reply failed
+        true
+    }
+
+    async fn consume_dns(
+        &mut self,
+        destination_mac: EthernetAddress,
+        ipv4_pkt: &Ipv4Packet<&[u8]>,
+    ) -> bool {
+        // Only inspect DNS packets when Softnet's DNS server is configured
+        let Some(dns_server) = &self.dns_server else {
+            return false;
+        };
+
+        // Accept only complete IPv4 UDP datagrams addressed to the gateway
+        if ipv4_pkt.dst_addr() != self.host.gateway_ip
+            || !ipv4_pkt.verify_checksum()
+            || ipv4_pkt.next_header() != IpProtocol::Udp
+            || ipv4_pkt.more_frags()
+            || ipv4_pkt.frag_offset() != 0
+        {
+            return false;
+        }
+
+        // Check the UDP header before reading its fields
+        let Ok(udp) = UdpPacket::new_checked(ipv4_pkt.payload()) else {
+            return false;
+        };
+
+        // Validate the UDP checksum, length, and DNS server port
+        if !udp.verify_checksum(
+            &IpAddress::Ipv4(ipv4_pkt.src_addr()),
+            &IpAddress::Ipv4(ipv4_pkt.dst_addr()),
+        ) || udp.dst_port() != DNS_PORT
+            || udp.len() as usize != ipv4_pkt.payload().len()
+        {
+            return false;
+        }
+
+        // Pass the request to Softnet's DNS server and send the reply
+        let result = match dns_server
+            .respond(
+                self.vm_mac_address,
+                destination_mac,
+                ipv4_pkt,
+                &udp,
+                self.host.max_packet_size as usize,
+            )
+            .await
+        {
+            Ok(Some(reply)) => self.write_to_vm(&reply),
+            Ok(None) => {
+                // Leave queries outside Softnet's DNS zone to the system DNS resolver
+                return false;
+            }
+            Err(err) => Err(err),
+        };
+
+        // Report failures to generate or send the reply
+        if let Err(err) = result {
+            sentry::capture_message(
+                &format!("Failed to reply to DNS request: {err:#}"),
                 sentry::Level::Warning,
             );
         }

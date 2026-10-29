@@ -4,6 +4,7 @@ use crate::manager::{Call, CallError, Reply, Request, VmConfig};
 use crate::network::MAX_VMS;
 use crate::proxy::Rule;
 use anyhow::Result;
+use hickory_server::proto::rr::Name;
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request as RpcRequest, Response, ResponsePayload,
     error::{
@@ -39,6 +40,9 @@ struct InitializeParams {
 struct VmParams {
     // Unique MAC address used by this VM
     vm_mac_address: String,
+
+    // Single-label VM name registered in our DNS zone
+    name: Option<String>,
 
     // Initial packet filter allow rules
     #[serde(default)]
@@ -130,7 +134,7 @@ impl Control {
                             "block": policy.block.iter().map(ToString::to_string).collect::<Vec<_>>(),
                             "ruleCount": policy.rule_count,
                         })),
-                        Err(CallError::InvalidVm(error)) => {
+                        Err(CallError::InvalidParams(error)) => {
                             Err(rpc_error(INVALID_PARAMS_CODE, error.to_string()))
                         }
                         Err(CallError::Failed(error)) => {
@@ -306,6 +310,16 @@ fn parse_initialize(
                 .vm_mac_address
                 .parse()
                 .map_err(|_| rpc_error(INVALID_PARAMS_CODE, "invalid vmMacAddress"))?;
+
+            // Parse optional VM names for DNS lookup
+            let name = params
+                .name
+                .map(|name| {
+                    Name::from_ascii(name)
+                        .map_err(|_| rpc_error(INVALID_PARAMS_CODE, "invalid name"))
+                })
+                .transpose()?;
+
             let (allow, block) = parse_policy(params.allow, params.block)?;
             let exposed_ports = params
                 .expose
@@ -320,6 +334,7 @@ fn parse_initialize(
             Ok(VmConfig {
                 vm_fd: fd,
                 vm_mac_address,
+                name,
                 allow,
                 block,
                 exposed_ports,

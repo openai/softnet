@@ -1,5 +1,6 @@
 use anyhow::{Context, anyhow};
 use clap::Parser;
+use hickory_server::proto::rr::Name;
 use log::LevelFilter;
 use oslog::OsLogger;
 use softnet::NetType;
@@ -51,6 +52,14 @@ struct Args {
 
     #[clap(long, requires = "vm_fd", help = "MAC address to enforce for the VM")]
     vm_mac_address: Option<mac_address::MacAddress>,
+
+    #[clap(
+        long,
+        requires = "vm_fd",
+        value_parser = |value: &str| Name::from_ascii(value),
+        help = "Single-label VM name to register as <NAME>.internal"
+    )]
+    vm_name: Option<Name>,
 
     #[clap(long, requires = "vm_fd", value_enum, help = "type of network to use for the VM", default_value_t=NetType::Nat)]
     vm_net_type: NetType,
@@ -261,6 +270,7 @@ async fn try_main() -> anyhow::Result<()> {
                         vec![VmConfig {
                             vm_fd,
                             vm_mac_address,
+                            name: args.vm_name,
                             allow: args.allow,
                             block: args.block,
                             exposed_ports: args.expose,

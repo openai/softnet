@@ -1,7 +1,12 @@
 use super::{Call, InitializationError, Manager, ProxyHandle, Reply, Request, VmConfig};
 use crate::NetType;
 use crate::control::Control;
+use crate::dhcp_server::DHCP_SERVER_MAC;
+use crate::dns_server::DNS_PORT;
 use crate::proxy::{Command, Policy};
+use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
+use hickory_server::proto::op::{Message, Query, ResponseCode};
+use hickory_server::proto::rr::{RData, RecordType, rdata::A};
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, INVALID_PARAMS_CODE};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -33,6 +38,7 @@ fn vm_config(socket: &impl AsFd, mac: &str) -> VmConfig {
     VmConfig {
         vm_fd: socket.as_fd().try_clone_to_owned().unwrap(),
         vm_mac_address: mac.parse().unwrap(),
+        name: None,
         allow: Vec::new(),
         block: Vec::new(),
         exposed_ports: Vec::new(),
@@ -818,7 +824,7 @@ async fn native_control_disconnect_keeps_vms_running() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
-async fn native_batch_rpc_preserves_order_and_independent_policies() {
+async fn native_batch_rpc_shares_dns_and_preserves_independent_policies() {
     let (control_socket, control_peer) = UnixStream::pair().unwrap();
     let mut manager = native_manager(Some(Control::new(control_socket.into()).unwrap()));
     let (first_socket, first_peer) = UnixDatagram::pair().unwrap();
@@ -831,8 +837,8 @@ async fn native_batch_rpc_preserves_order_and_independent_policies() {
         "params": {
             "vmNetType": "nat",
             "vms": [
-                {"vmMacAddress": "02:00:00:00:00:02", "allow": ["@host"]},
-                {"vmMacAddress": "02:00:00:00:00:03"},
+                {"vmMacAddress": "02:00:00:00:00:02", "name": "vm1", "allow": ["@host"]},
+                {"vmMacAddress": "02:00:00:00:00:03", "name": "vm2"},
             ],
         },
     });
@@ -849,6 +855,7 @@ async fn native_batch_rpc_preserves_order_and_independent_policies() {
         let reply = read_reply(&mut peer).await;
         drop(first_socket);
         drop(second_socket);
+        assert!(reply.get("error").is_none(), "{reply}");
         let vms = reply["result"]["vms"].as_array().unwrap();
         assert_eq!(vms.len(), 2);
         let first = vms[0]["vmId"].as_str().unwrap().to_owned();
@@ -909,6 +916,59 @@ async fn native_batch_rpc_preserves_order_and_independent_policies() {
         // Both VMs have distinct reserved addresses in the same /29 subnet
         assert_ne!(addresses[0], addresses[1]);
         assert_eq!(u32::from(addresses[0]) >> 3, u32::from(addresses[1]) >> 3);
+
+        // Resolve both VM names through each proxy's shared DNS server
+        let subnet = ipnet::Ipv4Net::new(addresses[0], crate::network::SUBNET_PREFIX_LEN).unwrap();
+        let gateway = subnet.hosts().next().unwrap();
+
+        for (socket, address, suffix) in [
+            (&first_peer, addresses[0], 2),
+            (&second_peer, addresses[1], 3),
+        ] {
+            socket.set_nonblocking(true).unwrap();
+            let socket = tokio::net::UnixDatagram::from_std(socket.try_clone().unwrap()).unwrap();
+
+            for (name, expected) in [
+                ("vm1.internal.", addresses[0]),
+                ("vm2.internal.", addresses[1]),
+            ] {
+                // Send a DNS query as a complete Ethernet frame from this VM
+                let mut query = Message::query();
+                query.add_query(Query::query(name.parse().unwrap(), RecordType::A));
+                let payload = query.to_vec().unwrap();
+                let builder = PacketBuilder::ethernet2([2, 0, 0, 0, 0, suffix], DHCP_SERVER_MAC.0)
+                    .ipv4(address.octets(), gateway.octets(), 64)
+                    .udp(53000, DNS_PORT);
+                let mut frame = Vec::with_capacity(builder.size(payload.len()));
+                builder.write(&mut frame, &payload).unwrap();
+                socket.send(&frame).await.unwrap();
+
+                // Ignore unrelated native traffic while waiting for this DNS reply
+                let mut frame = [0; 2048];
+
+                let response = loop {
+                    let len = socket.recv(&mut frame).await.unwrap();
+                    let packet = SlicedPacket::from_ethernet(&frame[..len]).unwrap();
+                    let Some(TransportSlice::Udp(udp)) = packet.transport else {
+                        continue;
+                    };
+
+                    if udp.source_port() != DNS_PORT || udp.destination_port() != 53000 {
+                        continue;
+                    }
+
+                    let response = Message::from_vec(udp.payload()).unwrap();
+                    if response.metadata.id == query.metadata.id {
+                        break response;
+                    }
+                };
+
+                // Both proxies must return the correct reservation for either name
+                assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(response.answers.len(), 1);
+                assert_eq!(response.answers[0].data, RData::A(A(expected)));
+            }
+        }
 
         // Address each VM explicitly and keep policy changes independent
         let reply = rpc(&mut peer, "softnet.policy.get", json!({})).await;

@@ -6,6 +6,7 @@ mod rules;
 mod vm;
 
 use crate::dhcp_server::DhcpServer;
+use crate::dns_server::DnsServer;
 use crate::host::Host;
 use crate::network::Network;
 use crate::vm::VM;
@@ -18,6 +19,7 @@ pub use rule::{Direction, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval};
@@ -46,6 +48,7 @@ pub struct Proxy {
     host: Host,
     vm_mac_address: smoltcp::wire::EthernetAddress,
     dhcp_server: DhcpServer,
+    dns_server: Option<Arc<DnsServer>>,
     rules: Rules,
     allow: Vec<Rule>,
     block: Vec<Rule>,
@@ -62,6 +65,7 @@ impl Proxy {
         network: &Network,
         allow: Vec<Rule>,
         block: Vec<Rule>,
+        dns_server: Option<Arc<DnsServer>>,
     ) -> Result<Proxy> {
         let vm_mac_address = EthernetAddress(vm_mac_address.bytes());
         let allow = normalize_rules(allow);
@@ -86,6 +90,7 @@ impl Proxy {
             host.vm_ip,
             network.subnet.netmask(),
             host.gateway_ip,
+            dns_server.iter().map(|server| server.domain()).collect(),
         );
 
         Ok(Proxy {
@@ -93,6 +98,7 @@ impl Proxy {
             host,
             vm_mac_address,
             dhcp_server,
+            dns_server,
             rules,
             allow,
             block,
@@ -136,7 +142,7 @@ impl Proxy {
                     coarsetime::Instant::update();
 
                     if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
-                        self.process_frame_from_vm(frame)?;
+                        self.process_frame_from_vm(frame).await?;
                     }
 
                     // Limit VM bursts to 128 packets (including the one we read above),
@@ -147,7 +153,7 @@ impl Proxy {
                                 coarsetime::Instant::update();
 
                                 if let Ok(frame) = EthernetFrame::new_checked(&buf[..n]) {
-                                    self.process_frame_from_vm(frame)?;
+                                    self.process_frame_from_vm(frame).await?;
                                 }
 
                                 tokio::task::consume_budget().await;
@@ -285,7 +291,7 @@ mod tests {
     use mac_address::MacAddress;
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
     use serial_test::serial;
-    use smoltcp::wire::{IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
+    use smoltcp::wire::{EthernetAddress, IpProtocol, Ipv4Address, Ipv4Packet, UdpPacket};
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::str::FromStr;
 
@@ -297,7 +303,11 @@ mod tests {
 
         assert_eq!(proxy.rules.len(), 1);
 
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "66.66.66.66")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -308,9 +318,21 @@ mod tests {
 
         assert_eq!(proxy.rules.len(), 2);
 
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.32").is_none());
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.33").is_some());
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.32")
+                .await
+                .is_none()
+        );
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.33")
+                .await
+                .is_some()
+        );
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "33.33.33.34")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -322,11 +344,19 @@ mod tests {
         assert_eq!(proxy.rules.len(), 2);
 
         // Access to global IPs should be disallowed because of --block=0.0.0.0/0
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, "8.8.8.8").is_none());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, "8.8.8.8")
+                .await
+                .is_none()
+        );
 
         // Despite the above, access to host IP address should be possible because of --allow=@host
         let gateway_ip = proxy.host.gateway_ip.to_string();
-        assert!(allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip).is_some());
+        assert!(
+            allowed_from_vm_ipv4(&mut proxy, vm_ip, &gateway_ip)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -343,7 +373,12 @@ mod tests {
 
         let fallback_reply = udp_packet(vm_ip, 1_234, fallback_peer, 40_000);
         let fallback_reply = Ipv4Packet::new_checked(fallback_reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(fallback_reply).is_none());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, fallback_reply)
+                .await
+                .is_none()
+        );
 
         let allowed_request = udp_packet(explicitly_allowed_peer, 40_000, vm_ip, 1_234);
         let allowed_request = Ipv4Packet::new_checked(allowed_request.as_slice()).unwrap();
@@ -351,7 +386,12 @@ mod tests {
 
         let allowed_reply = udp_packet(vm_ip, 1_234, explicitly_allowed_peer, 40_000);
         let allowed_reply = Ipv4Packet::new_checked(allowed_reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(allowed_reply).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, allowed_reply)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -367,7 +407,12 @@ mod tests {
 
         let reply = udp_packet(vm_ip, 1_234, peer, 40_000);
         let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(reply).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, reply)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -379,7 +424,12 @@ mod tests {
 
         let request = udp_packet(vm_ip, 1_234, peer, 40_000);
         let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(request).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, request)
+                .await
+                .is_some()
+        );
 
         let reply = udp_packet(peer, 40_000, vm_ip, 1_234);
         let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
@@ -397,7 +447,12 @@ mod tests {
         let peer = Ipv4Address::new(10, 1, 2, 3);
         let request = udp_packet(vm_ip, 40_000, peer, 1_234);
         let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
-        assert!(proxy.allowed_from_vm_ipv4(request).is_some());
+        assert!(
+            proxy
+                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, request)
+                .await
+                .is_some()
+        );
 
         // An equivalent policy must preserve the tracked permission for this reply
         let policy = proxy.policy_set(
@@ -451,13 +506,14 @@ mod tests {
                 .into_iter()
                 .map(|value| value.parse().unwrap())
                 .collect(),
+            None,
         )
         .unwrap();
 
         (proxy, peer)
     }
 
-    fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
+    async fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
         let mut buf = vec![0; 1500];
 
         let mut ipv4_pkt_mut = Ipv4Packet::new_unchecked(&mut buf[..]);
@@ -466,7 +522,9 @@ mod tests {
 
         let ipv4_pkt = Ipv4Packet::new_unchecked(buf.as_slice());
 
-        proxy.allowed_from_vm_ipv4(ipv4_pkt)
+        proxy
+            .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, ipv4_pkt)
+            .await
     }
 
     fn udp_packet(
