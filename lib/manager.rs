@@ -1,5 +1,6 @@
 use crate::control::Control;
 use crate::dhcp_server::DHCP_SERVER_MAC;
+use crate::dns_server::DnsServer;
 use crate::network::{MAX_VMS, NetType, Network, SUBNET_PREFIX_LEN};
 use crate::proxy::{Command, ExposedPort, Policy, Proxy, Rule};
 use crate::subnet_finder;
@@ -7,11 +8,13 @@ use crate::vm::VM;
 use anyhow::{Context, Result, ensure};
 use futures_util::FutureExt;
 use futures_util::future::OptionFuture;
+use hickory_server::proto::rr::Name;
 use mac_address::MacAddress;
 use privdrop::PrivDrop;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::task::JoinMap;
@@ -34,6 +37,7 @@ pub struct Manager {
 pub struct VmConfig<Fd = OwnedFd> {
     pub vm_fd: Fd,
     pub vm_mac_address: MacAddress,
+    pub name: Option<Name>,
     pub allow: Vec<Rule>,
     pub block: Vec<Rule>,
     pub exposed_ports: Vec<ExposedPort>,
@@ -46,9 +50,12 @@ pub struct InitializedVm {
     pub vm_mac_address: MacAddress,
 }
 
-/// Distinguish retryable rejection from fatal activation failure.
+/// Distinguish invalid parameters, retryable rejection, and fatal activation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum InitializationError {
+    #[error(transparent)]
+    InvalidParams(anyhow::Error),
+
     #[error(transparent)]
     Rejected(anyhow::Error),
 
@@ -86,10 +93,10 @@ pub(crate) enum Reply {
     Policy(Policy),
 }
 
-/// Keep VM selection errors distinct from operation failures.
+/// Keep invalid parameters distinct from operation failures.
 #[derive(Debug)]
 pub(crate) enum CallError {
-    InvalidVm(anyhow::Error),
+    InvalidParams(anyhow::Error),
     Failed(anyhow::Error),
 }
 
@@ -163,6 +170,9 @@ impl Manager {
             Request::Initialize { vm_net_type, vms } => {
                 match self.initialize(vm_net_type, vms).await {
                     Ok(vms) => Ok(Reply::Initialized(vms)),
+                    Err(InitializationError::InvalidParams(error)) => {
+                        Err(CallError::InvalidParams(error))
+                    }
                     Err(InitializationError::Rejected(error)) => Err(CallError::Failed(error)),
                     Err(InitializationError::ActivationFailed(error)) => {
                         // Give control a chance to send the failure reply before ending this run
@@ -179,7 +189,7 @@ impl Manager {
                     .await
                     .map(Reply::Policy)
                     .map_err(CallError::Failed),
-                Err(error) => Err(CallError::InvalidVm(error)),
+                Err(error) => Err(CallError::InvalidParams(error)),
             },
             Request::SetPolicy {
                 vm_id,
@@ -191,7 +201,7 @@ impl Manager {
                     .await
                     .map(Reply::Policy)
                     .map_err(CallError::Failed),
-                Err(error) => Err(CallError::InvalidVm(error)),
+                Err(error) => Err(CallError::InvalidParams(error)),
             },
         };
 
@@ -217,7 +227,7 @@ impl Manager {
             )));
         }
 
-        // Validate the complete batch before creating any native resources
+        // Validate MAC addresses before creating any native resources
         let mut mac_addresses = BTreeSet::new();
 
         for vm in &vms {
@@ -243,6 +253,8 @@ impl Manager {
 
         // Reserve the first usable address for the gateway
         let mut hosts = subnet.hosts().skip(1);
+
+        let mut dns_records = Vec::new();
         let mut configured = Vec::with_capacity(vms.len());
         let mut initialized = Vec::with_capacity(vms.len());
 
@@ -261,8 +273,20 @@ impl Manager {
                 vm_id,
                 vm_mac_address: config.vm_mac_address,
             });
+
+            // Collect DNS records for named VMs
+            if let Some(vm_name) = config.name.clone() {
+                dns_records.push((vm_name, vm_ip));
+            }
+
             configured.push((vm, config, vm_ip, vm_id));
         }
+
+        // Validate and share the DNS zone before preparing VM interfaces
+        let dns_server = (!dns_records.is_empty())
+            .then(|| DnsServer::new(dns_records).map(Arc::new))
+            .transpose()
+            .map_err(InitializationError::InvalidParams)?;
 
         // Register VM tasks before setup so failures are cleaned up through shutdown
         let mut proxy_senders = Vec::with_capacity(initialized.len());
@@ -306,7 +330,7 @@ impl Manager {
 
             // Finish the entire batch before giving a proxy to any VM task
             for (index, (vm, config, vm_ip, vm_id)) in configured.into_iter().enumerate() {
-                let proxy = Proxy::new(
+                let mut proxy = Proxy::new(
                     vm,
                     config.vm_mac_address,
                     vm_ip,
@@ -315,6 +339,11 @@ impl Manager {
                     config.block,
                 )
                 .with_context(|| format!("failed to initialize VM at index {index} ({vm_id})"))?;
+
+                if let Some(dns_server) = &dns_server {
+                    proxy.set_dns_server(dns_server.clone());
+                }
+
                 proxies.push(proxy);
             }
 

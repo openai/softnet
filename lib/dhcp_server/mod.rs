@@ -2,7 +2,7 @@ use anyhow::Result;
 use dhcproto::v4::{
     CLIENT_PORT, DhcpOption, Flags, HType, Message, MessageType, Opcode, OptionCode, SERVER_PORT,
 };
-use dhcproto::{Decodable, Encodable};
+use dhcproto::{Decodable, Encodable, Name};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol,
@@ -16,6 +16,7 @@ pub(crate) struct DhcpServer {
     vm_ip: Ipv4Address,
     subnet_mask: Ipv4Address,
     gateway_ip: Ipv4Address,
+    pub(crate) search_domains: Vec<Name>,
 }
 
 impl DhcpServer {
@@ -31,6 +32,7 @@ impl DhcpServer {
             vm_ip,
             subnet_mask,
             gateway_ip,
+            search_domains: Vec::new(),
         }
     }
 
@@ -165,6 +167,11 @@ impl DhcpServer {
         options.insert(DhcpOption::Router(vec![self.gateway_ip]));
         options.insert(DhcpOption::DomainNameServer(vec![self.gateway_ip]));
         options.insert(DhcpOption::AddressLeaseTime(u32::MAX));
+
+        // Advertise the configured DNS search domains for short-name resolution
+        if !self.search_domains.is_empty() {
+            options.insert(DhcpOption::DomainSearch(self.search_domains.clone()));
+        }
 
         reply
     }

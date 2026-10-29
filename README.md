@@ -78,6 +78,8 @@ Softnet can start with just `--control-fd` and create VMs through RPC.
 
 `softnet.initialize` accepts `vmNetType` (`"nat"` or `"host"`, default `"nat"`) and a `vms` array containing one to five VMs. Each VM requires a distinct `vmMacAddress` and accepts optional `allow`, `block`, and `expose` arrays, which default to empty. Rules and exposed TCP ports use the same syntax as the corresponding CLI arguments.
 
+Each VM may specify a unique single-label DNS `name`. Softnet answers queries for `<name>.internal` with that VM's reserved IPv4 address. It serves the shared authoritative `internal.` zone over UDP only, bypassing allow/block rules for these DNS queries. Other DNS queries use the system's DNS server.
+
 Attach exactly one VM socket descriptor per entry through `SCM_RIGHTS` to the first byte of the request frame, in the same order as `vms`. Keep the sender's descriptors open until the initialization response arrives.
 
 A successful response contains a `vms` array in request order; each entry includes a UUID string `vmId` and the corresponding `vmMacAddress`. Initialization drops privileges before responding.
@@ -85,7 +87,7 @@ A successful response contains a `vms` array in request order; each entry includ
 With two attached VM socket descriptors, a request and response look like this (each occupies one line; VM IDs are illustrative):
 
 ```json
-{"jsonrpc":"2.0","id":"42","method":"softnet.initialize","params":{"vmNetType":"nat","vms":[{"vmMacAddress":"02:00:00:00:00:02","allow":["@host"]},{"vmMacAddress":"02:00:00:00:00:03"}]}}
+{"jsonrpc":"2.0","id":"42","method":"softnet.initialize","params":{"vmNetType":"nat","vms":[{"vmMacAddress":"02:00:00:00:00:02","name":"vm1","allow":["@host"]},{"vmMacAddress":"02:00:00:00:00:03","name":"vm2"}]}}
 {"jsonrpc":"2.0","id":"42","result":{"vms":[{"vmId":"019a1b2c-3d4e-7000-8000-000000000001","vmMacAddress":"02:00:00:00:00:02"},{"vmId":"019a1b2c-3d4e-7000-8000-000000000002","vmMacAddress":"02:00:00:00:00:03"}]}}
 ```
 
