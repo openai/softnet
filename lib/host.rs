@@ -20,7 +20,7 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new(network: &Network, vm_ip: Ipv4Addr, enable_isolation: bool) -> Result<Host> {
+    pub fn new(network: &Network, vm_ip: Ipv4Addr) -> Result<Host> {
         // Instantiate vmnet's interface
         //
         // The interface retains the network reservation until it is stopped
@@ -28,7 +28,7 @@ impl Host {
             &network.handle,
             Options {
                 allocate_mac_address: Some(false),
-                enable_isolation: Some(enable_isolation),
+                enable_isolation: Some(false),
                 ..Default::default()
             },
         )
