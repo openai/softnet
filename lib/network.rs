@@ -31,6 +31,7 @@ pub(crate) struct Network {
     pub(crate) handle: vmnet::Network,
     pub(crate) subnet: Ipv4Net,
     pub(crate) gateway_ip: Ipv4Addr,
+    pub(crate) vm_ips: Vec<Ipv4Addr>,
 }
 
 impl Network {
@@ -102,6 +103,7 @@ impl Network {
             handle,
             subnet,
             gateway_ip,
+            vm_ips: reservations.iter().map(|(_, vm_ip)| *vm_ip).collect(),
         })
     }
 }

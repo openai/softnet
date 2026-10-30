@@ -29,6 +29,7 @@ pub enum Rule {
 pub enum Target {
     Prefix(Ipv4Net),
     Host,
+    Peers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumString)]
@@ -175,6 +176,7 @@ impl Target {
         match self {
             Target::Prefix(prefix) => Target::Prefix(prefix.trunc()),
             Target::Host => Target::Host,
+            Target::Peers => Target::Peers,
         }
     }
 }
@@ -183,10 +185,10 @@ impl FromStr for Target {
     type Err = ipnet::AddrParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        if input == "@host" {
-            Ok(Target::Host)
-        } else {
-            input.parse().map(Target::Prefix)
+        match input {
+            "@host" => Ok(Target::Host),
+            "@peers" => Ok(Target::Peers),
+            _ => input.parse().map(Target::Prefix),
         }
     }
 }
@@ -196,6 +198,7 @@ impl Display for Target {
         match self {
             Target::Prefix(prefix) => Display::fmt(prefix, formatter),
             Target::Host => formatter.write_str("@host"),
+            Target::Peers => formatter.write_str("@peers"),
         }
     }
 }
@@ -261,6 +264,10 @@ mod tests {
         assert_eq!(
             "@host".parse::<Rule>().unwrap(),
             Rule::Stateless(Target::Host)
+        );
+        assert_eq!(
+            "@peers".parse::<Rule>().unwrap(),
+            Rule::Stateless(Target::Peers)
         );
     }
 
@@ -329,6 +336,7 @@ mod tests {
         for (input, expected) in [
             ("in 10.1.2.3/8", "in 10.0.0.0/8"),
             ("@host", "@host"),
+            ("@peers", "@peers"),
             ("out proto udp port 53", "out proto udp 0.0.0.0/0 port 53"),
             (
                 "out proto tcp 10.1.2.3/8 port 08443",

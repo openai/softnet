@@ -39,7 +39,12 @@ pub(crate) struct Rules {
 }
 
 impl Rules {
-    pub(crate) fn new(host_address: Ipv4Address, allow: &[Rule], block: &[Rule]) -> Self {
+    pub(crate) fn new(
+        host_address: Ipv4Address,
+        peer_addresses: &[Ipv4Address],
+        allow: &[Rule],
+        block: &[Rule],
+    ) -> Self {
         // Preserve legacy behavior for bare-only policies. Once a directional rule
         // is present, compile the whole policy using directional semantics.
         let mode = if allow
@@ -65,7 +70,14 @@ impl Rules {
 
                         // Bare rules apply in both directions in stateful mode
                         if mode == Mode::Stateful {
-                            insert_filter(&mut inbound, target, filter, action, host_address);
+                            insert_filter(
+                                &mut inbound,
+                                target,
+                                filter,
+                                action,
+                                host_address,
+                                peer_addresses,
+                            );
                         }
 
                         (Direction::Out, target, filter)
@@ -81,7 +93,14 @@ impl Rules {
                     Direction::Out => &mut outbound,
                 };
 
-                insert_filter(entries, target, filter, action, host_address);
+                insert_filter(
+                    entries,
+                    target,
+                    filter,
+                    action,
+                    host_address,
+                    peer_addresses,
+                );
             }
         }
 
@@ -176,10 +195,21 @@ fn insert_filter(
     filter: Filter,
     action: Action,
     host_address: Ipv4Address,
+    peer_addresses: &[Ipv4Address],
 ) {
     let prefix = match target {
         Target::Prefix(prefix) => prefix,
         Target::Host => host_address.into(),
+        Target::Peers => {
+            for &address in peer_addresses {
+                entries
+                    .entry(address.into())
+                    .or_default()
+                    .insert(filter, action);
+            }
+
+            return;
+        }
     };
 
     entries.entry(prefix).or_default().insert(filter, action);
@@ -340,10 +370,23 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_peers() {
+        let peer = Ipv4Address::new(192, 168, 64, 3);
+        let allow = ["@peers".parse().unwrap()];
+        let rules = Rules::new(HOST, &[peer], &allow, &[]);
+
+        assert_eq!(
+            policy_decision(&rules, VM, peer, Direction::Out),
+            Some(PolicyDecision::AllowStateless)
+        );
+        assert_eq!(policy_decision(&rules, VM, HOST, Direction::Out), None);
+    }
+
+    #[test]
     fn test_policy_precedence() {
         let target = Ipv4Address::new(10, 0, 0, 1);
         let block = ["0.0.0.0/0".parse().unwrap()];
-        let rules = Rules::new(HOST, &["in 10.0.0.0/8".parse().unwrap()], &block);
+        let rules = Rules::new(HOST, &[], &["in 10.0.0.0/8".parse().unwrap()], &block);
 
         assert_eq!(
             policy_decision(&rules, target, VM, Direction::In),
@@ -355,7 +398,7 @@ mod tests {
         );
 
         let allow = ["in 10.0.0.0/8", "10.0.0.1/32"].map(|input| input.parse().unwrap());
-        let rules = Rules::new(HOST, &allow, &block);
+        let rules = Rules::new(HOST, &[], &allow, &block);
 
         assert_eq!(
             policy_decision(&rules, VM, target, Direction::Out),
@@ -367,7 +410,7 @@ mod tests {
     fn test_directional_rules_at_same_prefix_are_independent() {
         let allow = ["in @host", "out @host"].map(|input| input.parse().unwrap());
         let block = ["in @host".parse().unwrap()];
-        let rules = Rules::new(HOST, &allow, &block);
+        let rules = Rules::new(HOST, &[], &allow, &block);
 
         assert_eq!(
             policy_decision(&rules, HOST, VM, Direction::In),
@@ -383,7 +426,7 @@ mod tests {
     #[test]
     fn test_stateless_rules_are_outbound_only() {
         let target = Ipv4Address::new(10, 1, 2, 3);
-        let rules = Rules::new(HOST, &[], &["10.0.0.0/8".parse().unwrap()]);
+        let rules = Rules::new(HOST, &[], &[], &["10.0.0.0/8".parse().unwrap()]);
 
         assert!(policy_decision(&rules, target, VM, Direction::In).is_none());
         assert_eq!(
@@ -397,6 +440,7 @@ mod tests {
         let target = Ipv4Address::new(10, 1, 2, 3);
         let rules = Rules::new(
             HOST,
+            &[],
             &["10.1.0.0/16".parse().unwrap()],
             &["in 10.0.0.0/8".parse().unwrap()],
         );
@@ -415,7 +459,12 @@ mod tests {
             ("10.0.0.0/8", "out 10.0.0.0/8"),
             ("out 10.0.0.0/8", "10.0.0.0/8"),
         ] {
-            let rules = Rules::new(HOST, &[allow.parse().unwrap()], &[block.parse().unwrap()]);
+            let rules = Rules::new(
+                HOST,
+                &[],
+                &[allow.parse().unwrap()],
+                &[block.parse().unwrap()],
+            );
 
             assert_eq!(
                 policy_decision(&rules, VM, target, Direction::Out),
@@ -428,7 +477,7 @@ mod tests {
     fn test_directional_rule_makes_bare_rules_stateful() {
         let allow = "out @host".parse().unwrap();
         let block = "0.0.0.0/0".parse().unwrap();
-        let rules = Rules::new(HOST, &[allow], &[block]);
+        let rules = Rules::new(HOST, &[], &[allow], &[block]);
 
         assert_eq!(rules.len(), 3);
         assert!(rules.has_stateful());
@@ -452,7 +501,7 @@ mod tests {
         ]
         .map(|input| input.parse().unwrap());
         let block = ["10.1.2.3/32".parse().unwrap()];
-        let rules = Rules::new(HOST, &allow, &block);
+        let rules = Rules::new(HOST, &[], &allow, &block);
         let peer = Ipv4Address::new(10, 1, 2, 3);
 
         for (protocol, port, expected) in [
@@ -490,7 +539,7 @@ mod tests {
         ]
         .map(|input| input.parse().unwrap());
         let block = ["out 0.0.0.0/0".parse().unwrap()];
-        let rules = Rules::new(HOST, &allow, &block);
+        let rules = Rules::new(HOST, &[], &allow, &block);
 
         for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
             for (port, expected) in [
@@ -516,7 +565,7 @@ mod tests {
     fn full_port_range_does_not_allow_protocols_without_ports() {
         let allow = ["out proto udp @host port 1:65535".parse().unwrap()];
         let block = ["out 0.0.0.0/0".parse().unwrap()];
-        let rules = Rules::new(HOST, &allow, &block);
+        let rules = Rules::new(HOST, &[], &allow, &block);
 
         for port in [1, 65535] {
             let bytes = transport_packet(VM, 50_000, HOST, port, IpProtocol::Udp);
@@ -573,7 +622,12 @@ mod tests {
                 PolicyDecision::Block,
             ),
         ] {
-            let rules = Rules::new(HOST, &[allow.parse().unwrap()], &[block.parse().unwrap()]);
+            let rules = Rules::new(
+                HOST,
+                &[],
+                &[allow.parse().unwrap()],
+                &[block.parse().unwrap()],
+            );
 
             assert_eq!(
                 rules.policy_decision(&packet, Direction::Out),
@@ -593,7 +647,7 @@ mod tests {
             let block = format!("{direction} proto udp @host port 40000:50000")
                 .parse()
                 .unwrap();
-            let rules = Rules::new(HOST, &[], &[block]);
+            let rules = Rules::new(HOST, &[], &[], &[block]);
 
             // A reply's destination port comes from the initiating packet's source port
             for (source_port, destination_port, expected) in
@@ -623,8 +677,8 @@ mod tests {
             let rule = format!("in proto {protocol_name} @host port 8000:8100")
                 .parse()
                 .unwrap();
-            let allowing = Rules::new(HOST, &[rule], &[]);
-            let blocking = Rules::new(HOST, &[], &[rule]);
+            let allowing = Rules::new(HOST, &[], &[rule], &[]);
+            let blocking = Rules::new(HOST, &[], &[], &[rule]);
 
             // Build each case explicitly so the missing transport information is apparent
             let bytes = transport_packet(HOST, 50_000, VM, 8080, protocol);

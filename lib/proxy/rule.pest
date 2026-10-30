@@ -6,4 +6,4 @@ protocol = _{ "proto" ~ " "+ ~ protocol_name }
 protocol_name = { "tcp" | "udp" | "icmp" }
 port = _{ "port" ~ " "+ ~ destination_port }
 destination_port = @{ ASCII_DIGIT+ ~ (":" ~ ASCII_DIGIT+)? }
-target = @{ "@host" | (ASCII_DIGIT | "." | "/")+ }
+target = @{ "@host" | "@peers" | (ASCII_DIGIT | "." | "/")+ }
