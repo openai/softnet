@@ -91,14 +91,14 @@ impl Proxy {
             // The flow is either pending or untracked, evaluate it against outbound policy
             let dst_addr = ipv4_pkt.dst_addr();
 
-            match self.rules.policy_decision(dst_addr, Direction::Out) {
+            match self.rules.policy_decision(&ipv4_pkt, Direction::Out) {
                 // Return traffic was handled above; enforce explicit outbound blocks here
                 Some(PolicyDecision::Block) => return None,
 
                 // Track statelessly allowed traffic only when needed so its reply is not
                 // treated as a new inbound flow
                 Some(PolicyDecision::AllowStateless) => {
-                    return self.admit_with_tracking_if_stateful(pending, dst_addr, Direction::In);
+                    return self.admit_with_tracking_if_stateful(pending, &ipv4_pkt, Direction::In);
                 }
 
                 // Untracked packets cannot satisfy stateful policy

@@ -82,18 +82,22 @@ struct Args {
         requires = "vm_fd",
         help = "Comma-separated rules for allowing traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
-        * in TARGET: flows initiated from TARGET to the VM\n\
-        * out TARGET: flows initiated from the VM to TARGET\n\n\
-        Targets are:\n\n\
-        * IPv4 CIDRs\n\
-        * @host, which matches the vmnet bridge gateway IP\n\n\
+        * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
+        * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
+        Parameters:\n\n\
+        * TARGET: an IPv4 CIDR or @host (the vmnet bridge gateway IP); \
+        defaults to 0.0.0.0/0 when omitted\n\
+        * PROTO: tcp, udp, or icmp\n\
+        * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
-        When used with --block, the longest prefix match wins. If an identical rule is both \
-        allowed and blocked, blocking takes precedence.\n\n\
+        When used with --block, matching prefers a port, then the longest prefix, then a protocol, \
+        then the narrowest port range. Blocking wins ties.\n\n\
         Examples:\n\n\
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
         * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
         * --allow=\"out 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
+        * --allow=\"in proto tcp @host port 22\" — allow SSH from the host to the VM\n\
+        * --allow=\"in proto tcp port 49152:65535\" — allow TCP connections to the VM's dynamic port range\n\
         * --allow=\"in @host,out 192.168.0.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
         use_value_delimiter = true,
@@ -106,17 +110,19 @@ struct Args {
         requires = "vm_fd",
         help = "Comma-separated rules for blocking traffic, in the following forms:\n\n\
         * TARGET: traffic sent from the VM to TARGET; reverse traffic is not filtered by this rule\n\
-        * in TARGET: flows initiated from TARGET to the VM\n\
-        * out TARGET: flows initiated from the VM to TARGET\n\n\
-        Targets are:\n\n\
-        * IPv4 CIDRs\n\
-        * @host, which matches the vmnet bridge gateway IP\n\n\
+        * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
+        * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
+        Parameters:\n\n\
+        * TARGET: an IPv4 CIDR or @host (the vmnet bridge gateway IP); \
+        defaults to 0.0.0.0/0 when omitted\n\
+        * PROTO: tcp, udp, or icmp\n\
+        * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
-        When used with --allow, the longest prefix match wins. If an identical rule is both \
-        allowed and blocked, blocking takes precedence.\n\n\
+        When used with --allow, matching prefers a port, then the longest prefix, then a protocol, \
+        then the narrowest port range. Blocking wins ties.\n\n\
         Examples:\n\n\
         * --block=0.0.0.0/0 — establish a stateless default-deny egress policy\n\
-        * --block=\"out @host\" — block stateful flows initiated toward @host\n\
+        * --block=\"out proto tcp port 22\" — block SSH from the VM to any host\n\
         * --block=\"out 66.66.66.0/24\" — block stateful flows initiated toward this CIDR\n\
         * --block=\"out @host,out 66.66.66.0/24\" — multiple rules may be comma-separated",
         value_name = "comma-separated rules",
