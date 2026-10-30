@@ -84,10 +84,7 @@ impl Proxy {
         };
 
         // The flow is either pending or untracked, evaluate it against inbound policy
-        match self
-            .rules
-            .policy_decision(ipv4_pkt.src_addr(), Direction::In)
-        {
+        match self.rules.policy_decision(ipv4_pkt, Direction::In) {
             // Return traffic was handled above; enforce explicit inbound blocks here
             Some(PolicyDecision::Block) => None,
 
@@ -99,9 +96,7 @@ impl Proxy {
 
             // No inbound rule matched, so allow by default. Track the flow when needed
             // so its reply is not treated as a new outbound flow
-            None => {
-                self.admit_with_tracking_if_stateful(pending, ipv4_pkt.src_addr(), Direction::Out)
-            }
+            None => self.admit_with_tracking_if_stateful(pending, ipv4_pkt, Direction::Out),
         }
     }
 }

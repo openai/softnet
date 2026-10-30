@@ -45,6 +45,9 @@ coarsetime = "0.1.37"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jsonrpsee-types = "0.26"
+pest = "2.9.4"
+pest_derive = "2.9.4"
+strum = { version = "0.28", features = ["derive"] }
 uuid = { version = "1", features = ["v7"] }
 unix-ancillary = { version = "0.6.1", features = ["tokio"] }
 

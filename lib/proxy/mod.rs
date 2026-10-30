@@ -14,9 +14,9 @@ use anyhow::Result;
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
 use mac_address::MacAddress;
-pub use rule::{Direction, Rule, Target};
+pub use rule::{Direction, Filter, PortRange, Protocol, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
-use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Packet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,10 +232,10 @@ impl Proxy {
     fn admit_with_tracking_if_stateful(
         &mut self,
         pending: Option<PendingFlow>,
-        peer_addr: Ipv4Address,
+        ipv4_pkt: &Ipv4Packet<&[u8]>,
         return_direction: Direction,
     ) -> Option<()> {
-        if self.rules.is_stateful(peer_addr, return_direction) {
+        if self.rules.is_stateful(ipv4_pkt, return_direction) {
             self.admit_with_tracking_if_trackable(pending)
         } else {
             Some(())
@@ -391,23 +391,44 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_directional_egress_block_does_not_block_reply_to_unmatched_inbound_flow() {
-        let (mut proxy, _peer) = create_proxy(vec![], vec!["out 203.0.113.0/24"]);
-        let vm_ip = proxy.host.vm_ip;
-        let peer = Ipv4Address::new(203, 0, 113, 1);
+    async fn inbound_replies_preserve_directional_rules_and_private_egress_defaults() {
+        for (block, reply_allowed) in [
+            ("out 10.0.0.0/8", true),
+            ("out proto udp 10.0.0.0/8 port 40000", true),
+            ("out proto udp 10.0.0.0/8 port 53", false),
+            ("out proto tcp 10.0.0.0/8", false),
+        ] {
+            let (mut proxy, _peer) = create_proxy(vec![], vec![block]);
+            let vm_ip = proxy.host.vm_ip;
+            let peer = Ipv4Address::new(10, 1, 2, 3);
+            let reply = udp_packet(vm_ip, 1_234, peer, 40_000);
 
-        let request = udp_packet(peer, 40_000, vm_ip, 1_234);
-        let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
-        assert!(proxy.allowed_from_host_ipv4(&request).is_some());
+            assert!(
+                !allows_vm_packet(&mut proxy, &reply).await,
+                "{block}: unsolicited outbound traffic must be blocked"
+            );
 
-        let reply = udp_packet(vm_ip, 1_234, peer, 40_000);
-        let reply = Ipv4Packet::new_checked(reply.as_slice()).unwrap();
-        assert!(
-            proxy
-                .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, reply)
-                .await
-                .is_some()
-        );
+            // Default-admitted inbound traffic keeps private egress restrictions unless tracked
+            let request = udp_packet(peer, 40_000, vm_ip, 1_234);
+            let request = Ipv4Packet::new_checked(request.as_slice()).unwrap();
+
+            assert!(
+                proxy.allowed_from_host_ipv4(&request).is_some(),
+                "{block}: inbound request must be admitted"
+            );
+            assert_eq!(
+                allows_vm_packet(&mut proxy, &reply).await,
+                reply_allowed,
+                "{block}: reply policy"
+            );
+
+            let unrelated = udp_packet(vm_ip, 1_235, peer, 40_000);
+
+            assert!(
+                !allows_vm_packet(&mut proxy, &unrelated).await,
+                "{block}: unrelated outbound traffic must remain blocked"
+            );
+        }
     }
 
     #[tokio::test]
@@ -506,6 +527,15 @@ mod tests {
         .unwrap();
 
         (proxy, peer)
+    }
+
+    async fn allows_vm_packet(proxy: &mut Proxy, bytes: &[u8]) -> bool {
+        let packet = Ipv4Packet::new_checked(bytes).unwrap();
+
+        proxy
+            .allowed_from_vm_ipv4(EthernetAddress::BROADCAST, packet)
+            .await
+            .is_some()
     }
 
     async fn allowed_from_vm_ipv4(proxy: &mut Proxy, src: Ipv4Address, dst: &str) -> Option<()> {
