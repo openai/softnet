@@ -19,7 +19,8 @@ impl VM {
         sock.set_nonblocking(true)?;
 
         Ok(VM {
-            sock: AsyncFd::new(sock)?,
+            // SAFETY: sock owns its descriptor, which remains open and unchanged while registered.
+            sock: unsafe { AsyncFd::register(sock)? },
         })
     }
 

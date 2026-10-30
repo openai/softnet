@@ -31,8 +31,8 @@ thiserror = "2"
 ip_network = "0"
 uzers = "0"
 system-configuration = "0"
-sentry = { version = "0", features = ["debug-images"] }
-sentry-anyhow = { version = "0", features = ["backtrace"] }
+sentry = { version = "0.49.3", features = ["debug-images"] }
+sentry-anyhow = { version = "0.49.3", features = ["backtrace"] }
 nix = { version = "0", features = ["fs", "socket"] }
 network-interface = "2"
 prefix-trie = "0"
