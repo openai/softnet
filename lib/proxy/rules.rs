@@ -201,7 +201,6 @@ fn insert_filter(
         Target::Prefix(prefix) => prefix,
         Target::Host => host_address.into(),
         Target::Peers => {
-            // Match only configured peers, including when the shared subnet has unused addresses
             for &address in peer_addresses {
                 entries
                     .entry(address.into())
