@@ -13,7 +13,6 @@ use crate::vm::VM;
 use anyhow::Result;
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
-use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 pub use rule::{Direction, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
@@ -72,11 +71,7 @@ impl Proxy {
         let block = normalize_rules(block);
 
         // Create this VM's vmnet interface on the shared network
-        let host = Host::new(
-            network,
-            vm_ip,
-            !allow.contains(&Rule::Stateless(Target::Prefix(Ipv4Net::default()))),
-        )?;
+        let host = Host::new(network, vm_ip)?;
 
         let rules = Rules::new(host.gateway_ip, &allow, &block);
 

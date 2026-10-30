@@ -90,8 +90,6 @@ struct Args {
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
         When used with --block, the longest prefix match wins. If an identical rule is both \
         allowed and blocked, blocking takes precedence.\n\n\
-        --allow=0.0.0.0/0 additionally disables bridge isolation, even when \
-        --block=0.0.0.0/0 is specified.\n\n\
         Examples:\n\n\
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
         * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
