@@ -85,8 +85,8 @@ struct Args {
         * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
         * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
         Parameters:\n\n\
-        * TARGET: an IPv4 CIDR or @host (the vmnet bridge gateway IP); \
-        defaults to 0.0.0.0/0 when omitted\n\
+        * TARGET: an IPv4 CIDR, @host (the vmnet bridge gateway IP), or @peers \
+        (other configured VMs' reserved IPs on this Softnet network); defaults to 0.0.0.0/0 when omitted\n\
         * PROTO: tcp, udp, or icmp\n\
         * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\
@@ -96,6 +96,7 @@ struct Args {
         * --allow=192.168.0.0/24 — allow stateless traffic with this LAN\n\
         * --allow=\"in @host\" — allow stateful flows initiated from @host\n\
         * --allow=\"out 192.168.0.0/24\" — allow stateful flows initiated toward this LAN\n\
+        * --allow=\"out @peers\" — allow stateful flows initiated toward other VMs\n\
         * --allow=\"in proto tcp @host port 22\" — allow SSH from the host to the VM\n\
         * --allow=\"in proto tcp port 49152:65535\" — allow TCP connections to the VM's dynamic port range\n\
         * --allow=\"in @host,out 192.168.0.0/24\" — multiple rules may be comma-separated",
@@ -113,8 +114,8 @@ struct Args {
         * in [proto PROTO] [TARGET] [port PORT]: flows initiated toward the VM\n\
         * out [proto PROTO] [TARGET] [port PORT]: flows initiated by the VM\n\n\
         Parameters:\n\n\
-        * TARGET: an IPv4 CIDR or @host (the vmnet bridge gateway IP); \
-        defaults to 0.0.0.0/0 when omitted\n\
+        * TARGET: an IPv4 CIDR, @host (the vmnet bridge gateway IP), or @peers \
+        (other configured VMs' reserved IPs on this Softnet network); defaults to 0.0.0.0/0 when omitted\n\
         * PROTO: tcp, udp, or icmp\n\
         * PORT: destination port or inclusive START:END range (TCP/UDP only)\n\n\
         Directional rules make bare TARGET rules stateful in both directions.\n\n\

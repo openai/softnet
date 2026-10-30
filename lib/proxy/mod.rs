@@ -46,6 +46,7 @@ pub struct Proxy {
     vm: VM,
     host: Host,
     vm_mac_address: smoltcp::wire::EthernetAddress,
+    peer_ips: Vec<Ipv4Addr>,
     dhcp_server: DhcpServer,
     dns_server: Option<Arc<DnsServer>>,
     rules: Rules,
@@ -73,7 +74,14 @@ impl Proxy {
         // Create this VM's vmnet interface on the shared network
         let host = Host::new(network, vm_ip)?;
 
-        let rules = Rules::new(host.gateway_ip, &allow, &block);
+        // Keep the other VMs' reservations for initial and replacement policies
+        let peer_ips: Vec<_> = network
+            .vm_ips
+            .iter()
+            .copied()
+            .filter(|peer_ip| *peer_ip != vm_ip)
+            .collect();
+        let rules = Rules::new(host.gateway_ip, &peer_ips, &allow, &block);
 
         // Any stateful rule enables flow inspection for the whole VM, including
         // traffic admitted through implicit global and gateway fallbacks
@@ -92,6 +100,7 @@ impl Proxy {
             vm,
             host,
             vm_mac_address,
+            peer_ips,
             dhcp_server,
             dns_server,
             rules,
@@ -256,7 +265,7 @@ impl Proxy {
 
         // Keep existing tracked flows when the normalized policy is unchanged
         if self.allow != allow || self.block != block {
-            self.rules = Rules::new(self.host.gateway_ip, &allow, &block);
+            self.rules = Rules::new(self.host.gateway_ip, &self.peer_ips, &allow, &block);
             self.allow = allow;
             self.block = block;
             self.flows = self.rules.has_stateful().then(FlowTable::new);
