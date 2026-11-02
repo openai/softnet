@@ -34,6 +34,11 @@ struct Response {
     max_payload: u16,
 }
 
+/// Validates whether a DNS name is a single, non-FQDN, non-wildcard label suitable for VM names.
+pub fn is_valid_vm_name(name: &Name) -> bool {
+    !name.is_fqdn() && name.num_labels() == 1 && !name.is_wildcard()
+}
+
 impl DnsServer {
     pub(crate) fn new(records: Vec<(Name, Ipv4Addr)>) -> Result<Self> {
         // Initialize the DNS zone
@@ -57,7 +62,7 @@ impl DnsServer {
 
         for (name, address) in records {
             // Validate single-label VM names before checking for duplicates
-            if name.is_fqdn() || name.num_labels() != 1 || name.is_wildcard() {
+            if !is_valid_vm_name(&name) {
                 bail!("invalid VM name {name}: expected a single DNS label");
             }
 

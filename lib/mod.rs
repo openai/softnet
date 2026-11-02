@@ -1,7 +1,7 @@
 pub mod control;
 mod control_transport;
 mod dhcp_server;
-mod dns_server;
+pub mod dns_server;
 mod host;
 mod network;
 pub use network::NetType;

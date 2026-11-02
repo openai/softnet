@@ -302,6 +302,16 @@ fn rejects_invalid_initialization_and_closes_every_descriptor() {
             json!({"vms": [valid_vm, {"vmMacAddress": "02:00:00:00:00:03", "expose": ["bad"]}]}),
             2,
         ),
+        // Multi-label VM names must be rejected before manager dispatch
+        (
+            json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "name": "foo.bar"}]}),
+            1,
+        ),
+        // FQDN VM names must be rejected before manager dispatch
+        (
+            json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "name": "foo.internal."}]}),
+            1,
+        ),
     ];
 
     for (params, descriptor_count) in cases {

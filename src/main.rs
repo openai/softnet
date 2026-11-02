@@ -5,6 +5,7 @@ use log::LevelFilter;
 use oslog::OsLogger;
 use softnet::NetType;
 use softnet::control::Control;
+use softnet::dns_server::is_valid_vm_name;
 use softnet::manager::{Manager, VmConfig};
 use softnet::proxy::ExposedPort;
 use softnet::proxy::Rule;
@@ -56,7 +57,7 @@ struct Args {
     #[clap(
         long,
         requires = "vm_fd",
-        value_parser = |value: &str| Name::from_ascii(value),
+        value_parser = parse_vm_name,
         help = "Single-label VM name to register as <NAME>.internal"
     )]
     vm_name: Option<Name>,
@@ -306,6 +307,14 @@ fn parse_vm_fd(value: &str) -> Result<c_int, String> {
     Ok(vm_fd)
 }
 
+fn parse_vm_name(value: &str) -> Result<Name, String> {
+    let name = Name::from_ascii(value).map_err(|err| format!("invalid VM name: {err}"))?;
+    if !is_valid_vm_name(&name) {
+        return Err("VM name must be a single DNS label (no dots, not FQDN, not wildcard)".to_string());
+    }
+    Ok(name)
+}
+
 fn sudo_escalation_works() -> bool {
     let exe = std::env::current_exe().unwrap();
     let args = std::env::args().skip(1);
@@ -411,5 +420,37 @@ mod tests {
                 .to_string()
                 .contains("file descriptor must be non-negative")
         );
+    }
+
+    #[test]
+    fn test_cli_rejects_multi_label_vm_name_before_startup() {
+        for invalid_name in ["foo.bar", "foo.internal.", "*.foo"] {
+            let error = Args::try_parse_from([
+                "softnet",
+                "--vm-fd=3",
+                "--vm-mac-address=02:00:00:00:00:01",
+                &format!("--vm-name={invalid_name}"),
+            ])
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("VM name must be a single DNS label"),
+                "expected validation error for {invalid_name:?}, got: {}",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_accepts_single_label_vm_name() {
+        let args = Args::try_parse_from([
+            "softnet",
+            "--vm-fd=3",
+            "--vm-mac-address=02:00:00:00:00:01",
+            "--vm-name=myvm",
+        ])
+        .unwrap();
+
+        assert!(args.vm_name.is_some());
     }
 }
