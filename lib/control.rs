@@ -1,5 +1,6 @@
 use crate::NetType;
 use crate::control_transport::{ControlTransport, Frame};
+use crate::dns_server::is_valid_vm_name;
 use crate::manager::{Call, CallError, Reply, Request, VmConfig};
 use crate::network::MAX_VMS;
 use crate::proxy::Rule;
@@ -315,8 +316,15 @@ fn parse_initialize(
             let name = params
                 .name
                 .map(|name| {
-                    Name::from_ascii(name)
-                        .map_err(|_| rpc_error(INVALID_PARAMS_CODE, "invalid name"))
+                    let parsed = Name::from_ascii(&name)
+                        .map_err(|_| rpc_error(INVALID_PARAMS_CODE, "invalid name"))?;
+                    if !is_valid_vm_name(&parsed) {
+                        return Err(rpc_error(
+                            INVALID_PARAMS_CODE,
+                            "invalid name: expected a single DNS label",
+                        ));
+                    }
+                    Ok(parsed)
                 })
                 .transpose()?;
 
