@@ -5,7 +5,7 @@ use log::LevelFilter;
 use oslog::OsLogger;
 use softnet::NetType;
 use softnet::control::Control;
-use softnet::dns_server::is_valid_vm_name;
+use softnet::is_valid_vm_name;
 use softnet::manager::{Manager, VmConfig};
 use softnet::proxy::ExposedPort;
 use softnet::proxy::Rule;
