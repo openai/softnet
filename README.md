@@ -25,6 +25,13 @@ Softnet solves two problems:
 
 Up to five VMs in one Softnet process share a [`vmnet` network](https://developer.apple.com/documentation/vmnet/vmnet_network_create(_:_:)) with a private `/29` subnet selected to avoid overlap with existing host interface subnets. Softnet reserves an IP-address for each VM's MAC-address, delivers it through its own DHCP-server, and uses the reserved address for packet filtering.
 
+By default, Softnet selects that `/29` from RFC 1918 address space. Use
+`--subnet-pool CIDR` to restrict allocation to a private range reserved for
+guests. The option may be repeated or given a comma-separated list, for example
+`--subnet-pool 192.168.64.0/18,172.20.0.0/16`. Each pool must be large enough
+to contain a `/29`; candidates that overlap a subnet configured on a host
+interface are still skipped.
+
 ### Stateful flow authorization
 
 Stateful `in`/`out` rules use a bounded authorization cache that records the

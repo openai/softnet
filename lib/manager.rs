@@ -9,6 +9,7 @@ use anyhow::{Context, Result, ensure};
 use futures_util::FutureExt;
 use futures_util::future::OptionFuture;
 use hickory_server::proto::rr::Name;
+use ipnet::Ipv4Net;
 use mac_address::MacAddress;
 use privdrop::PrivDrop;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +31,7 @@ pub struct Manager {
     group: String,
     initialized: bool,
     default_vm_id: Option<Uuid>,
+    subnet_pool: Vec<Ipv4Net>,
 }
 
 /// One VM's configuration and raw or owned packet socket.
@@ -120,7 +122,13 @@ impl Manager {
             group,
             initialized: false,
             default_vm_id: None,
+            subnet_pool: Vec::new(),
         }
+    }
+
+    pub fn with_subnet_pool(mut self, subnet_pool: Vec<Ipv4Net>) -> Self {
+        self.subnet_pool = subnet_pool;
+        self
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -247,7 +255,12 @@ impl Manager {
         }
 
         // Find an unused subnet for the gateway and VMs
-        let (_, _, subnet) = subnet_finder::find_available_subnet(SUBNET_PREFIX_LEN)
+        let subnet = if self.subnet_pool.is_empty() {
+            subnet_finder::find_available_subnet(SUBNET_PREFIX_LEN)
+        } else {
+            subnet_finder::find_available_subnet_in(SUBNET_PREFIX_LEN, &self.subnet_pool)
+        };
+        let (_, _, subnet) = subnet
             .context("failed to initialize proxy")
             .map_err(InitializationError::Rejected)?;
 
