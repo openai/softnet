@@ -16,6 +16,7 @@ fn hub_config(peer: Option<Peer>) -> Config {
     Config {
         address: PEER,
         route: "10.77.1.0/24".parse().unwrap(),
+        mtu: None,
         peer,
     }
 }
@@ -32,6 +33,7 @@ fn config(remote: &WireGuard, address: Ipv4Addr) -> Config {
     Config {
         address,
         route: "10.77.0.0/16".parse().unwrap(),
+        mtu: None,
         peer: Some(peer(remote.status())),
     }
 }
@@ -48,7 +50,7 @@ fn packet(source: Ipv4Addr, destination: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
 async fn send(local: &mut WireGuard, payload: &[u8]) {
     let bytes = packet(VM, PEER, payload);
     let ip = Ipv4Packet::new_checked(bytes.as_slice()).unwrap();
-    local.send_vm_ipv4(&ip, VM).await;
+    assert_eq!(local.send_vm_ipv4(&ip, VM).await, None);
 }
 
 async fn receive(local: &mut WireGuard, remote: &mut WireGuard, expected: &[u8]) {
@@ -97,7 +99,7 @@ async fn hub_prefix_routes_both_directions_and_excludes_the_local_address() {
     let to_self = packet(VM, LOCAL, b"local destination");
     let ip = Ipv4Packet::new_checked(to_self.as_slice()).unwrap();
     assert!(spoke.reserves(LOCAL));
-    spoke.send_vm_ipv4(&ip, VM).await;
+    assert_eq!(spoke.send_vm_ipv4(&ip, VM).await, None);
     send(&mut spoke, b"outbound").await;
     receive(&mut spoke, &mut hub, &packet(LOCAL, PEER, b"outbound")).await;
 
@@ -113,6 +115,35 @@ async fn hub_prefix_routes_both_directions_and_excludes_the_local_address() {
 
     hub.send_ipv4(&packet(PEER, LOCAL, b"inbound")).await;
     assert_vm_receive(&mut spoke, Some(&packet(PEER, VM, b"inbound"))).await;
+}
+
+#[tokio::test]
+async fn configured_mtu_returns_feedback_only_for_oversized_df_packets() {
+    let mut hub = remote().await;
+    let mut spoke = WireGuard::new(config(&hub, LOCAL)).await.unwrap();
+    hub.apply(hub_config(Some(peer(spoke.status())))).unwrap();
+
+    // An existing tunnel uses the replacement configuration immediately
+    let mut desired = config(&hub, LOCAL);
+    desired.mtu = Some(1380);
+    spoke.apply(desired).unwrap();
+
+    for (length, df, advertised_mtu) in [
+        (1381, true, Some(1380)),
+        (1380, true, None),
+        (1381, false, None),
+    ] {
+        let mut bytes = packet(VM, PEER, &vec![0xa5; length - 28]);
+        let mut ip = Ipv4Packet::new_unchecked(&mut bytes[..]);
+        ip.set_dont_frag(df);
+        let ip = Ipv4Packet::new_checked(&bytes[..]).unwrap();
+        assert_eq!(spoke.send_vm_ipv4(&ip, VM).await, advertised_mtu);
+
+        if advertised_mtu.is_none() {
+            translate(&mut bytes, Translation::FromVm { source: LOCAL }).unwrap();
+            receive(&mut spoke, &mut hub, &bytes).await;
+        }
+    }
 }
 
 #[tokio::test]

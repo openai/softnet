@@ -660,6 +660,7 @@ mod tests {
             .wireguard_set(Config {
                 address: Ipv4Address::new(198, 18, 0, 1),
                 route: "198.18.0.0/24".parse().unwrap(),
+                mtu: None,
                 peer: None,
             })
             .await

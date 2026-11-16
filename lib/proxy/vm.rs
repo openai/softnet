@@ -1,9 +1,11 @@
+use crate::dhcp_server::DHCP_SERVER_MAC;
 use crate::dns_server::DNS_PORT;
 use crate::proxy::flows::{FlowDirection, FlowMatch};
 use crate::proxy::{Direction, PolicyDecision, Proxy};
 use anyhow::Context;
 use anyhow::Result;
 use dhcproto::v4::SERVER_PORT;
+use etherparse::{Icmpv4Type, PacketBuilder, icmpv4::DestUnreachableHeader};
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
@@ -78,7 +80,26 @@ impl Proxy {
             if let Some(wireguard) = &mut self.wireguard
                 && wireguard.reserves(ipv4_pkt.dst_addr())
             {
-                wireguard.send_vm_ipv4(&ipv4_pkt, self.host.vm_ip).await;
+                let mtu_to_advertise = wireguard.send_vm_ipv4(&ipv4_pkt, self.host.vm_ip).await;
+
+                // Packet won't fit into the WireGuard tunnel, reply with ICMP Fragmentation Needed
+                // while suppressing ICMP errors for Ethernet broadcasts and multicasts[1]
+                //
+                // [1]: https://www.rfc-editor.org/info/rfc1812/#section-4.3.2.7
+                if let Some(mtu) = mtu_to_advertise
+                    && destination_mac.is_unicast()
+                {
+                    let reply = fragmentation_needed_frame(
+                        &ipv4_pkt,
+                        mtu,
+                        self.host.gateway_ip,
+                        self.vm_mac_address,
+                    );
+                    if let Err(error) = reply.and_then(|frame| self.write_to_vm(&frame)) {
+                        log::debug!("failed to send ICMP Fragmentation Needed: {error:#}");
+                    }
+                }
+
                 return None;
             }
 
@@ -232,6 +253,32 @@ impl Proxy {
     }
 }
 
+fn fragmentation_needed_frame(
+    ip: &Ipv4Packet<&[u8]>,
+    mtu: u16,
+    gateway: Ipv4Address,
+    vm_mac: EthernetAddress,
+) -> Result<Vec<u8>> {
+    // Quote the original IPv4 header and first eight transport bytes
+    let mut quote = [0; IPV4_HEADER_LEN_WITHOUT_OPTIONS as usize + 8];
+    let original = ip
+        .as_ref()
+        .get(..quote.len())
+        .context("IPv4 packet too short for ICMP quote")?;
+    quote.copy_from_slice(original);
+    Ipv4Packet::new_unchecked(&mut quote[..]).fill_checksum();
+
+    let builder = PacketBuilder::ethernet2(DHCP_SERVER_MAC.0, vm_mac.0)
+        .ipv4(gateway.octets(), ip.src_addr().octets(), 64)
+        .icmpv4(Icmpv4Type::DestinationUnreachable(
+            DestUnreachableHeader::FragmentationNeeded { next_hop_mtu: mtu },
+        ));
+    let mut frame = Vec::with_capacity(builder.size(quote.len()));
+    builder.write(&mut frame, &quote)?;
+
+    Ok(frame)
+}
+
 fn vm_arp_allowed(
     arp_pkt: ArpPacket<&[u8]>,
     vm_mac_address: smoltcp::wire::EthernetAddress,
@@ -264,6 +311,41 @@ mod tests {
     use smoltcp::wire::{
         ArpHardware, ArpOperation, ArpPacket, EthernetAddress, EthernetProtocol, Ipv4Address,
     };
+
+    #[test]
+    fn fragmentation_needed_frame_quotes_original_guest_datagram() {
+        use super::{DHCP_SERVER_MAC, EthernetFrame, IpProtocol, Ipv4Packet, PacketBuilder};
+        use smoltcp::wire::Icmpv4Packet;
+
+        let vm = Ipv4Address::new(192, 168, 64, 2);
+        let gateway = Ipv4Address::new(192, 168, 64, 1);
+        let vm_mac = EthernetAddress([2, 0, 0, 0, 0, 2]);
+        let mut oversized = Vec::new();
+        PacketBuilder::ipv4(vm.octets(), [10, 77, 2, 2], 64)
+            .tcp(50_000, 80, 1, 2048)
+            .write(&mut oversized, &[0xa5; 1460])
+            .unwrap();
+        let mut packet = Ipv4Packet::new_unchecked(&mut oversized[..]);
+        packet.set_dont_frag(true);
+        packet.fill_checksum();
+        let expected_quote = oversized[..28].to_vec();
+        Ipv4Packet::new_unchecked(&mut oversized[..]).set_checksum(0);
+
+        let packet = Ipv4Packet::new_checked(&oversized[..]).unwrap();
+        let frame = super::fragmentation_needed_frame(&packet, 1380, gateway, vm_mac).unwrap();
+        let frame = EthernetFrame::new_checked(&frame[..]).unwrap();
+        let reply = Ipv4Packet::new_checked(frame.payload()).unwrap();
+        let icmp = Icmpv4Packet::new_checked(reply.payload()).unwrap();
+        assert_eq!(frame.src_addr(), DHCP_SERVER_MAC);
+        assert_eq!(frame.dst_addr(), vm_mac);
+        assert_eq!(reply.src_addr(), gateway);
+        assert_eq!(reply.dst_addr(), vm);
+        assert_eq!(reply.next_header(), IpProtocol::Icmp);
+        assert!(reply.verify_checksum() && icmp.verify_checksum());
+        assert_eq!(&reply.payload()[..2], &[3, 4]);
+        assert_eq!(&reply.payload()[6..8], &1380u16.to_be_bytes());
+        assert_eq!(&reply.payload()[8..], expected_quote);
+    }
 
     #[test]
     fn test_allowed_from_vm_arp_allows_unspecified_request() {

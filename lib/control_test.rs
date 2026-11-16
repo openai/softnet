@@ -203,6 +203,7 @@ fn parses_flat_wireguard_params_with_optional_vm_id() {
         assert_eq!(vm_id, expected);
         assert_eq!(params.route, "10.77.0.0/24".parse().unwrap());
         assert!(params.peer.is_none());
+        assert_eq!(params.mtu, None);
     }
 }
 
@@ -212,6 +213,7 @@ fn validates_wireguard_set_params() {
     let endpoint = "192.0.2.1:30000";
     let desired = json!({
         "address": "10.77.1.2",
+        "mtu": 1380,
         "peers": [{
             "publicKey": public_key,
             "endpoint": endpoint,
@@ -234,6 +236,7 @@ fn validates_wireguard_set_params() {
     };
     let config = parse_config(desired.clone()).unwrap();
     config.validate("192.168.64.0/24".parse().unwrap()).unwrap();
+    assert_eq!(config.mtu, Some(1380));
     assert_eq!(
         config.peer,
         Some(Peer::new(public_key.to_owned(), endpoint.parse().unwrap(), 15).unwrap())
@@ -242,6 +245,8 @@ fn validates_wireguard_set_params() {
     for (case, field, value) in [
         ("null address", "address", json!(null)),
         ("loopback address", "address", json!("127.0.0.1")),
+        ("MTU below IPv4 minimum", "mtu", json!(67)),
+        ("MTU exceeds UDP ceiling", "mtu", json!(65_476)),
         ("empty routes", "routes", json!([])),
         (
             "multiple routes",

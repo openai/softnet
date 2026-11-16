@@ -1076,6 +1076,7 @@ async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
         let mut remote = WireGuard::new(wireguard::Config {
             address: hub.0,
             route: "198.18.0.0/24".parse().unwrap(),
+            mtu: None,
             peer: None,
         })
         .await
@@ -1086,7 +1087,7 @@ async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
         assert!(reply.get("error").is_none(), "{reply}");
         let status = &reply["result"];
         let listen_port = u16::try_from(status["listenPort"].as_u64().unwrap()).unwrap();
-        let mut remote_config = wireguard::Config::new(hub.0, "198.18.0.0/24").unwrap();
+        let mut remote_config = wireguard::Config::new(hub.0, "198.18.0.0/24", None).unwrap();
         remote_config.peer = Some(
             wireguard::Peer::new(
                 status["publicKey"].as_str().unwrap().to_owned(),

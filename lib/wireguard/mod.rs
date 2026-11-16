@@ -45,6 +45,7 @@ struct ActivePeer {
 pub(crate) struct WireGuard {
     address: Ipv4Addr,
     route: Ipv4Net,
+    mtu: Option<u16>,
     peer: Option<ActivePeer>,
     bound_port: u16,
     public_key: String,
@@ -71,6 +72,7 @@ impl WireGuard {
         Ok(Self {
             address: desired.address,
             route: desired.route,
+            mtu: desired.mtu,
             peer,
             bound_port: socket.local_addr()?.port(),
             public_key: STANDARD.encode(PublicKey::from(&private_key).as_bytes()),
@@ -95,9 +97,15 @@ impl WireGuard {
     }
 
     /// Translates the source address of a VM packet and attempts to send it through the tunnel.
-    pub(crate) async fn send_vm_ipv4(&mut self, ip: &Ipv4Packet<&[u8]>, vm_ip: Ipv4Addr) {
+    ///
+    /// For an oversized DF packet, returns the MTU to advertise to the guest instead.
+    pub(crate) async fn send_vm_ipv4(
+        &mut self,
+        ip: &Ipv4Packet<&[u8]>,
+        vm_ip: Ipv4Addr,
+    ) -> Option<u16> {
         if ip.src_addr() != vm_ip || self.peer.is_none() || ip.dst_addr() == self.address {
-            return;
+            return None;
         }
 
         // Own the reusable buffer while sending through the mutable tunnel
@@ -106,16 +114,27 @@ impl WireGuard {
         packet.extend_from_slice(&ip.as_ref()[..usize::from(ip.total_len())]);
 
         // Validate and translate the datagram before handing it to the authenticated peer
+        let mut fragmentation_needed = None;
+
         if let Some(length) = translate(
             &mut packet,
             Translation::FromVm {
                 source: self.address,
             },
         ) {
-            self.send_ipv4(&packet[..length]).await;
+            if let Some(mtu) = self.mtu
+                && ip.dont_frag()
+                && length > usize::from(mtu)
+            {
+                fragmentation_needed = Some(mtu);
+            } else {
+                self.send_ipv4(&packet[..length]).await;
+            }
         }
 
         self.outbound = packet;
+
+        fragmentation_needed
     }
 
     /// Receives one tunnel packet, returning `None` if it cannot be delivered to the VM.
@@ -140,6 +159,7 @@ impl WireGuard {
     pub(crate) fn apply(&mut self, desired: Config) -> Result<()> {
         if self.address == desired.address
             && self.route == desired.route
+            && self.mtu == desired.mtu
             && self.peer.as_ref().map(|peer| &peer.config) == desired.peer.as_ref()
         {
             return Ok(());
@@ -149,6 +169,7 @@ impl WireGuard {
         self.peer = build_peer(&self.private_key, desired.peer)?;
         self.address = desired.address;
         self.route = desired.route;
+        self.mtu = desired.mtu;
 
         Ok(())
     }

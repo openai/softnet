@@ -86,6 +86,7 @@ struct WireGuardSetParams {
     vm_id: Option<String>,
     address: Ipv4Addr,
     routes: [String; 1],
+    mtu: Option<u16>,
     peers: Vec<WireGuardPeerParams>,
 }
 
@@ -276,10 +277,11 @@ fn parse_method(
                 vm_id,
                 address,
                 routes: [route],
+                mtu,
                 peers,
             } = params.parse()?;
             let vm_id = parse_vm_id(vm_id)?;
-            let params = parse_wireguard_config(address, &route, peers)
+            let params = parse_wireguard_config(address, &route, mtu, peers)
                 .map_err(|error| rpc_error(INVALID_PARAMS_CODE, error.to_string()))?;
 
             Ok(Request::SetWireGuard { vm_id, params })
@@ -291,9 +293,10 @@ fn parse_method(
 fn parse_wireguard_config(
     address: Ipv4Addr,
     route: &str,
+    mtu: Option<u16>,
     peers: Vec<WireGuardPeerParams>,
 ) -> Result<Config> {
-    let mut config = Config::new(address, route)?;
+    let mut config = Config::new(address, route, mtu)?;
     let mut peers = peers.into_iter();
     if let Some(peer) = peers.next() {
         ensure!(
