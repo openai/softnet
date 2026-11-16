@@ -3,7 +3,8 @@ use crate::control_transport::{ControlTransport, Frame};
 use crate::manager::{Call, CallError, Reply, Request, VmConfig};
 use crate::network::MAX_VMS;
 use crate::proxy::Rule;
-use anyhow::Result;
+use crate::wireguard::{Config, Peer};
+use anyhow::{Result, ensure};
 use hickory_server::proto::rr::Name;
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request as RpcRequest, Response, ResponsePayload,
@@ -14,6 +15,7 @@ use jsonrpsee_types::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -78,6 +80,26 @@ struct SetParams {
     block: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WireGuardSetParams {
+    vm_id: Option<String>,
+    address: Ipv4Addr,
+    routes: [String; 1],
+    peers: Vec<WireGuardPeerParams>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WireGuardPeerParams {
+    public_key: String,
+    endpoint: SocketAddrV4,
+    #[serde(rename = "allowedIPs")]
+    allowed_ips: [String; 1],
+    #[serde(default)]
+    persistent_keepalive_seconds: u16,
+}
+
 impl Control {
     pub fn new(control_fd: OwnedFd) -> Result<Self> {
         Ok(Self {
@@ -134,6 +156,7 @@ impl Control {
                             "block": policy.block.iter().map(ToString::to_string).collect::<Vec<_>>(),
                             "ruleCount": policy.rule_count,
                         })),
+                        Ok(Reply::WireGuardStatus(status)) => Ok(json!(status)),
                         Err(CallError::InvalidParams(error)) => {
                             Err(rpc_error(INVALID_PARAMS_CODE, error.to_string()))
                         }
@@ -243,8 +266,52 @@ fn parse_method(
                 block,
             })
         }
+        "softnet.wireguard.set" => {
+            let params = request.params();
+            if !params.is_object() {
+                return Err(rpc_error(INVALID_PARAMS_CODE, "expected an object"));
+            }
+
+            let WireGuardSetParams {
+                vm_id,
+                address,
+                routes: [route],
+                peers,
+            } = params.parse()?;
+            let vm_id = parse_vm_id(vm_id)?;
+            let params = parse_wireguard_config(address, &route, peers)
+                .map_err(|error| rpc_error(INVALID_PARAMS_CODE, error.to_string()))?;
+
+            Ok(Request::SetWireGuard { vm_id, params })
+        }
         _ => Err(rpc_error(METHOD_NOT_FOUND_CODE, "method not found")),
     }
+}
+
+fn parse_wireguard_config(
+    address: Ipv4Addr,
+    route: &str,
+    peers: Vec<WireGuardPeerParams>,
+) -> Result<Config> {
+    let mut config = Config::new(address, route)?;
+    let mut peers = peers.into_iter();
+    if let Some(peer) = peers.next() {
+        ensure!(
+            peers.next().is_none(),
+            "Softnet currently supports at most one WireGuard peer"
+        );
+        ensure!(
+            peer.allowed_ips == [route],
+            "peer allowedIPs must equal routes"
+        );
+        config.peer = Some(Peer::new(
+            peer.public_key,
+            peer.endpoint,
+            peer.persistent_keepalive_seconds,
+        )?);
+    }
+
+    Ok(config)
 }
 
 fn parse_vm_id(vm_id: Option<String>) -> std::result::Result<Option<Uuid>, ErrorObjectOwned> {

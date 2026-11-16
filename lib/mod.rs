@@ -9,3 +9,4 @@ pub mod manager;
 pub mod proxy;
 mod subnet_finder;
 mod vm;
+pub(crate) mod wireguard;

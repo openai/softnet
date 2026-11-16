@@ -4,12 +4,14 @@ use crate::control::Control;
 use crate::dhcp_server::DHCP_SERVER_MAC;
 use crate::dns_server::DNS_PORT;
 use crate::proxy::{Command, Policy};
+use crate::wireguard::{self, WireGuard};
 use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
 use hickory_server::proto::op::{Message, Query, ResponseCode};
 use hickory_server::proto::rr::{RData, RecordType, rdata::A};
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, INVALID_PARAMS_CODE};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::time::Duration;
@@ -503,51 +505,6 @@ async fn multi_vm_batch_requires_explicit_target_after_vm_completion() {
 }
 
 #[tokio::test]
-async fn single_vm_batch_uses_its_default_policy_target() {
-    let mut manager = Manager::new("unused".into(), "unused".into(), None);
-    let id = Uuid::now_v7();
-    manager.initialized = true;
-    manager.default_vm_id = Some(id);
-    let (commands_tx, mut commands_rx) = mpsc::channel(1);
-    manager.proxy_handles.insert(
-        id,
-        ProxyHandle {
-            commands: commands_tx,
-        },
-    );
-    manager.proxy_tasks.spawn(id, async move {
-        let Some(Command::PolicyGet { reply }) = commands_rx.recv().await else {
-            panic!("expected a policy request");
-        };
-
-        reply.send(Policy::default()).unwrap();
-        assert!(commands_rx.recv().await.is_none());
-
-        Ok(())
-    });
-    let (reply_tx, reply_rx) = oneshot::channel();
-
-    // An omitted VM ID resolves to the single VM selected at initialization
-    timeout(
-        TIMEOUT,
-        manager.dispatch(Call {
-            request: Request::GetPolicy { vm_id: None },
-            reply: reply_tx,
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        reply_rx.await.unwrap(),
-        Ok(Reply::Policy(policy)) if policy == Policy::default()
-    ));
-
-    timeout(TIMEOUT, manager.shutdown()).await.unwrap().unwrap();
-    assert!(manager.proxy_handle(None).is_err());
-}
-
-#[tokio::test]
 async fn shutdown_closes_control_with_an_unanswered_request() {
     let (socket, peer) = UnixStream::pair().unwrap();
     let mut manager = Manager::new(
@@ -1022,6 +979,182 @@ async fn native_batch_rpc_shares_dns_and_preserves_independent_policies() {
     }
 }
 
+async fn native_guest_address(guest: &tokio::net::UnixDatagram, mac: [u8; 6]) -> Ipv4Addr {
+    use dhcproto::v4::{DhcpOption, Message as DhcpMessage, MessageType};
+    use dhcproto::{Decodable, Encodable};
+
+    // Discover the guest's dynamic reservation over its packet socket
+    let mut discover = DhcpMessage::default();
+    discover.set_xid(42).set_chaddr(&mac);
+    discover
+        .opts_mut()
+        .insert(DhcpOption::MessageType(MessageType::Discover));
+    let mut frame = Vec::new();
+    PacketBuilder::ethernet2(mac, DHCP_SERVER_MAC.0)
+        .ipv4([0; 4], [255; 4], 64)
+        .udp(68, 67)
+        .write(&mut frame, &discover.to_vec().unwrap())
+        .unwrap();
+    guest.send(&frame).await.unwrap();
+
+    let mut frame = [0; 2048];
+    loop {
+        let length = guest.recv(&mut frame).await.unwrap();
+        if let Ok(packet) = SlicedPacket::from_ethernet(&frame[..length])
+            && let Some(TransportSlice::Udp(udp)) = packet.transport
+            && (udp.source_port(), udp.destination_port()) == (67, 68)
+        {
+            let offer = DhcpMessage::from_bytes(udp.payload()).unwrap();
+            assert_eq!(offer.xid(), discover.xid());
+            assert_eq!(offer.opts().msg_type(), Some(MessageType::Offer));
+            return offer.yiaddr();
+        }
+    }
+}
+
+fn tcp_ack(source: (Ipv4Addr, u16), destination: (Ipv4Addr, u16), payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::new();
+    PacketBuilder::ipv4(source.0.octets(), destination.0.octets(), 64)
+        .tcp(source.1, destination.1, 10, 1024)
+        .ack(20)
+        .write(&mut packet, payload)
+        .unwrap();
+    packet
+}
+
+fn ethernet_frame(source: [u8; 6], destination: [u8; 6], packet: &[u8]) -> Vec<u8> {
+    let header = etherparse::Ethernet2Header {
+        source,
+        destination,
+        ether_type: etherparse::EtherType::IPV4,
+    };
+    let mut frame = header.to_bytes().to_vec();
+    frame.extend_from_slice(packet);
+    frame
+}
+
+fn wireguard_config(address: Ipv4Addr, peer_status: &Value) -> Value {
+    let port = peer_status["listenPort"].as_u64().unwrap();
+    json!({
+        "address": address, "routes": ["198.18.0.0/24"],
+        "peers": [{
+            "publicKey": peer_status["publicKey"], "endpoint": format!("127.0.0.1:{port}"),
+            "allowedIPs": ["198.18.0.0/24"]
+        }]
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
+    let (control_socket, control_peer) = UnixStream::pair().unwrap();
+    let mut manager = native_manager(Some(Control::new(control_socket.into()).unwrap()));
+    let (socket, guest) = tokio::net::UnixDatagram::pair().unwrap();
+    let (other_socket, _other_guest) = UnixDatagram::pair().unwrap();
+    let mut vm = vm_config(&socket, "02:00:00:00:00:02");
+    let other_vm = vm_config(&other_socket, "02:00:00:00:00:03");
+    let mac = vm.vm_mac_address.bytes();
+    vm.block = vec![
+        "in 0.0.0.0/0".parse().unwrap(),
+        "out 0.0.0.0/0".parse().unwrap(),
+    ];
+    let vms = timeout(
+        TIMEOUT,
+        manager.initialize(NetType::Nat, vec![other_vm, vm]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let vm_id = vms[1].vm_id;
+    control_peer.set_nonblocking(true).unwrap();
+    let mut peer = BufReader::new(tokio::net::UnixStream::from_std(control_peer).unwrap());
+
+    let client = async {
+        let local = (native_guest_address(&guest, mac).await, 50000);
+        let overlay = (Ipv4Addr::new(198, 18, 0, 1), local.1);
+        let hub = (Ipv4Addr::new(198, 18, 0, 2), 8080);
+        let mut remote = WireGuard::new(wireguard::Config {
+            address: hub.0,
+            route: "198.18.0.0/24".parse().unwrap(),
+            peer: None,
+        })
+        .await
+        .unwrap();
+        let mut config = wireguard_config(overlay.0, &json!(remote.status()));
+        config["vmId"] = json!(vm_id);
+        let reply = rpc(&mut peer, "softnet.wireguard.set", config.clone()).await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let status = &reply["result"];
+        let listen_port = u16::try_from(status["listenPort"].as_u64().unwrap()).unwrap();
+        let mut remote_config = wireguard::Config::new(hub.0, "198.18.0.0/24").unwrap();
+        remote_config.peer = Some(
+            wireguard::Peer::new(
+                status["publicKey"].as_str().unwrap().to_owned(),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen_port),
+                0,
+            )
+            .unwrap(),
+        );
+        remote.apply(remote_config).unwrap();
+
+        // Only the ACK from the reserved guest MAC and IP should reach the peer
+        let wrong_mac = [2, 0, 0, 0, 0, 9];
+        for (source_mac, source, payload) in [
+            (wrong_mac, local, b"wrong MAC".as_slice()),
+            (mac, overlay, b"wrong IP"),
+            (mac, local, b"outbound"),
+        ] {
+            let packet = tcp_ack(source, hub, payload);
+            guest
+                .send(&ethernet_frame(source_mac, DHCP_SERVER_MAC.0, &packet))
+                .await
+                .unwrap();
+        }
+        let mut buffer = [0; 2048];
+        let length = remote.receive_ipv4(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..length], tcp_ack(overlay, hub, b"outbound"));
+
+        // A rejected key and a change to ordinary policy must preserve the live tunnel
+        config["peers"][0]["publicKey"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        config["address"] = json!("198.18.0.99");
+        let reply = rpc(&mut peer, "softnet.wireguard.set", config).await;
+        assert_eq!(reply["error"]["code"], CALL_EXECUTION_FAILED_CODE);
+        let reply = rpc(
+            &mut peer,
+            "softnet.policy.set",
+            json!({"vmId": vm_id, "allow": [], "block": ["in 0.0.0.0/0"]}),
+        )
+        .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        remote.send_ipv4(&tcp_ack(hub, overlay, b"inbound")).await;
+        loop {
+            let length = guest.recv(&mut buffer).await.unwrap();
+            if let Ok(packet) = SlicedPacket::from_ethernet(&buffer[..length])
+                && let Some(TransportSlice::Tcp(tcp)) = packet.transport
+                && tcp.destination_port() == local.1
+            {
+                let expected = tcp_ack(hub, local, b"inbound");
+                assert_eq!(
+                    &buffer[..length],
+                    ethernet_frame(DHCP_SERVER_MAC.0, mac, &expected)
+                );
+                break;
+            }
+        }
+    };
+
+    timeout(TIMEOUT, async {
+        tokio::select! {
+            result = manager.run() => panic!("manager stopped with connected VM: {result:?}"),
+            () = client => {}
+        }
+    })
+    .await
+    .unwrap();
+    timeout(TIMEOUT, manager.shutdown()).await.unwrap().unwrap();
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn native_shutdown_waits_for_initialization_and_cleanup() {
@@ -1182,7 +1315,7 @@ async fn native_initialize_drops_credentials_and_rejects_reinitialization() {
         "jsonrpc": "2.0",
         "id": "test",
         "method": "softnet.initialize",
-        "params": {"vms": [{"vmMacAddress": "02:00:00:00:00:02"}]},
+        "params": {"vms": [{"vmMacAddress": "02:00:00:00:00:02", "allow": ["@host"]}]},
     });
     control_peer
         .send_fds_all(format!("{request}\n").as_bytes(), &[&socket])
@@ -1197,6 +1330,14 @@ async fn native_initialize_drops_credentials_and_rejects_reinitialization() {
         assert_eq!(reply["result"]["vms"].as_array().unwrap().len(), 1);
         assert_eq!(uzers::get_current_uid(), user.uid());
         assert_eq!(uzers::get_current_gid(), group.gid());
+
+        // An omitted vmId selects the only VM in the batch
+        let reply = rpc(&mut control_peer, "softnet.policy.get", json!({})).await;
+        assert_eq!(
+            reply["result"],
+            json!({"allow": ["@host"], "block": [], "ruleCount": 1})
+        );
+
         drop(vm_peer);
         assert_eq!(control_peer.read(&mut [0]).await.unwrap(), 0);
     };

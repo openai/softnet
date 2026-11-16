@@ -12,6 +12,8 @@ inherits = "release"
 debug = true
 
 [dependencies]
+base64 = "0.22"
+boringtun = "0.7.1"
 smoltcp = "0"
 etherparse = "0.21"
 libc = "0"
@@ -36,7 +38,7 @@ sentry-anyhow = { version = "0.49.3", features = ["backtrace"] }
 nix = { version = "0", features = ["fs", "socket"] }
 network-interface = "2"
 prefix-trie = "0"
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 rand = "0.10"
 oslog = "0.2.0"
 log = "0.4.29"

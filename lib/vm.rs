@@ -147,7 +147,7 @@ mod tests {
     use super::VM;
     use std::fs::File;
     use std::net::UdpSocket;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::time::Duration;
 
@@ -171,12 +171,9 @@ mod tests {
     }
 
     #[test]
-    fn test_new_rejects_closed_fd() {
-        let (socket, _peer) = UnixDatagram::pair().unwrap();
-        let vm_fd = socket.as_raw_fd();
-        drop(socket);
-
-        let error = VM::new(vm_fd).err().unwrap();
+    fn test_new_rejects_out_of_range_fd() {
+        // The kernel cannot allocate this descriptor number
+        let error = VM::new(RawFd::MAX).err().unwrap();
 
         assert!(
             error

@@ -74,6 +74,14 @@ impl Proxy {
                 return None;
             }
 
+            // Use WireGuard exclusively for destinations in the reserved prefix
+            if let Some(wireguard) = &mut self.wireguard
+                && wireguard.reserves(ipv4_pkt.dst_addr())
+            {
+                wireguard.send_vm_ipv4(&ipv4_pkt, self.host.vm_ip).await;
+                return None;
+            }
+
             // Consult the flow table before evaluating outbound policy
             // so established flows are not treated as new traffic
             let pending = match self
