@@ -4,7 +4,7 @@ mod nat;
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use boringtun::{
-    noise::{Tunn, TunnResult},
+    noise::{Tunn, TunnResult, errors::WireGuardError},
     x25519::{PublicKey, StaticSecret},
 };
 pub(crate) use config::Config;
@@ -267,12 +267,22 @@ impl WireGuard {
 
         // Keep timer updates and their best-effort sends together across receive cancellation
         if let Some(peer) = &mut self.peer {
-            let endpoint = peer.config.endpoint;
-            if let TunnResult::WriteToNetwork(datagram) =
-                peer.tunnel.update_timers(&mut self.scratch)
-                && let Err(error) = self.socket.try_send_to(datagram, endpoint.into())
-            {
-                log::debug!("WireGuard send to {endpoint} failed: {error}");
+            match peer.tunnel.update_timers(&mut self.scratch) {
+                TunnResult::WriteToNetwork(datagram) => {
+                    let endpoint = peer.config.endpoint;
+                    if let Err(error) = self.socket.try_send_to(datagram, endpoint.into()) {
+                        log::debug!("WireGuard send to {endpoint} failed: {error}");
+                    }
+                }
+                TunnResult::Err(WireGuardError::ConnectionExpired)
+                    if peer.tunnel.persistent_keepalive().is_some() =>
+                {
+                    // Let BoringTun send the next handshake on its retry timer
+                    let _ = peer
+                        .tunnel
+                        .format_handshake_initiation(&mut self.scratch, false);
+                }
+                _ => {}
             }
         }
 
