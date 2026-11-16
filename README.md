@@ -112,4 +112,24 @@ Policy updates are atomic: all rules are parsed and a new prefix map is built be
 
 When the normalized allow or block policy changes, Softnet clears the flow table so the new policy applies to established flows immediately. This may interrupt active connections. Repeating the same normalized policy is a no-op and preserves the flow table.
 
-Use `block=["0.0.0.0/0"]` with specific allow rules for a default-deny egress policy. Closing the control socket leaves the last accepted policy active.
+Use `block=["0.0.0.0/0"]` with specific allow rules for a default-deny egress policy on traffic forwarded through `vmnet`. Closing the control socket leaves the last accepted policy active.
+
+### Per-VM WireGuard
+
+To route traffic from a running VM to `10.77.0.0/24` through a WireGuard peer, send `softnet.wireguard.set` with the peer's public key and IPv4 UDP endpoint. Include `vmId` in both WireGuard methods if Softnet initialized multiple VMs.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"softnet.wireguard.set","params":{"address":"10.77.1.2","routes":["10.77.0.0/24"],"peers":[{"publicKey":"<remote-public-key>","endpoint":"192.0.2.10:51820","allowedIPs":["10.77.0.0/24"]}]}}
+```
+
+Softnet returns its public key and UDP listen port.
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"publicKey":"<softnet-public-key>","listenPort":54321}}
+```
+
+The guest keeps its DHCP address. The peer sees it as `10.77.1.2`, so configure the returned `publicKey` on the peer with `AllowedIPs = 10.77.1.2/32`. If the peer's tunnel address is `10.77.0.1`, run `ping 10.77.0.1` from the guest to check the tunnel.
+
+Use one canonical IPv4 prefix in both `routes` and the single peer's `allowedIPs`. Keep the prefix and `address` outside the VM subnet. The tunnel carries unfragmented TCP, UDP and ICMP echo traffic and bypasses the VM's `allow`/`block` rules. Optional `mtu` sets the inner IPv4 path MTU. The peer's `persistentKeepaliveSeconds` defaults to `0` (off).
+
+To exchange keys first, send `set` with `"peers":[]`. Softnet returns its `publicKey` and UDP `listenPort` and drops traffic to the reserved prefix. Repeat `set` with the peer to start forwarding with the same key and port. Call `softnet.wireguard.clear` to release the route and port and discard the key.
