@@ -93,7 +93,7 @@ impl WireGuard {
     }
 
     pub(crate) fn reserves(&self, address: Ipv4Addr) -> bool {
-        self.route.contains(&address)
+        address == self.address || self.route.contains(&address)
     }
 
     /// Translates the source address of a VM packet and attempts to send it through the tunnel.

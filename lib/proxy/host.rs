@@ -43,7 +43,7 @@ impl Proxy {
                 let ipv4_pkt = Ipv4Packet::new_unchecked(frame.payload());
                 Ipv4Repr::parse(&ipv4_pkt, &ChecksumCapabilities::ignored()).ok()?;
 
-                // Drop vmnet packets with source IPs in the reserved WireGuard prefix
+                // Drop vmnet packets with source IPs reserved for WireGuard
                 if let Some(wireguard) = &self.wireguard
                     && wireguard.reserves(ipv4_pkt.src_addr())
                 {

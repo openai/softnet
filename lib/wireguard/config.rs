@@ -14,7 +14,7 @@ pub(crate) struct Config {
     /// Inner IPv4 path MTU, if known.
     pub mtu: Option<u16>,
 
-    /// Remote WireGuard peer. With `None`, traffic to the reserved prefix is dropped.
+    /// Remote WireGuard peer. With `None`, traffic to reserved addresses is dropped.
     pub peer: Option<Peer>,
 }
 
@@ -49,6 +49,12 @@ impl Config {
             !self.route.contains(&subnet) && !subnet.contains(&self.route),
             "WireGuard route {} overlaps VM subnet {subnet}",
             self.route
+        );
+
+        ensure!(
+            !subnet.contains(&self.address),
+            "WireGuard address {} belongs to VM subnet {subnet}",
+            self.address
         );
 
         Ok(())

@@ -76,7 +76,7 @@ impl Proxy {
                 return None;
             }
 
-            // Use WireGuard exclusively for destinations in the reserved prefix
+            // Keep WireGuard destinations out of vmnet
             if let Some(wireguard) = &mut self.wireguard
                 && wireguard.reserves(ipv4_pkt.dst_addr())
             {

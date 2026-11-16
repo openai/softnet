@@ -647,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn reserved_wireguard_routes_cannot_use_vmnet_in_either_direction() {
+    async fn reserved_wireguard_addresses_cannot_use_vmnet_in_either_direction() {
         use crate::wireguard::Config;
         use etherparse::PacketBuilder;
         use smoltcp::wire::EthernetFrame;
@@ -656,21 +656,35 @@ mod tests {
         let (mut proxy, peer) = create_proxy(vec!["0.0.0.0/0"], vec![]);
         let guest = UnixDatagram::from(peer);
         guest.set_nonblocking(true).unwrap();
+        let overlay = Ipv4Address::new(198, 18, 1, 2);
+        let remote = Ipv4Address::new(198, 18, 0, 2);
+        let route = "198.18.0.2/32";
         proxy
-            .wireguard_set(Config {
-                address: Ipv4Address::new(198, 18, 0, 1),
-                route: "198.18.0.0/24".parse().unwrap(),
-                mtu: None,
-                peer: None,
-            })
+            .wireguard_set(Config::new(overlay, route, None).unwrap())
             .await
             .unwrap();
-        let remote = Ipv4Address::new(198, 18, 0, 2);
-        let local = proxy.host.vm_ip;
-        let outbound = udp_packet(local, 50_000, remote, 8080);
 
-        // Even a permissive vmnet policy must not receive an unadmitted reserved destination
-        assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+        // Reject a local overlay address that collides with the vmnet gateway
+        let gateway = proxy.host.gateway_ip;
+        let error = proxy
+            .wireguard_set(Config::new(gateway, route, None).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "WireGuard address {gateway} belongs to VM subnet {}",
+                proxy.subnet
+            )
+        );
+
+        let local = proxy.host.vm_ip;
+
+        // Keep both addresses out of vmnet even under a permissive egress policy
+        for destination in [remote, overlay] {
+            let outbound = udp_packet(local, 50_000, destination, 8080);
+            assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+        }
 
         // Non-tunnel destinations still follow ordinary policy and require the VM source address
         let ordinary = Ipv4Address::new(203, 0, 113, 2);
@@ -682,21 +696,23 @@ mod tests {
         assert!(!allows_vm_packet(&mut proxy, &outbound).await);
 
         // Ordinary inbound frames cannot impersonate a source reserved for authenticated traffic
-        let mut inbound = Vec::new();
-        PacketBuilder::ethernet2(
-            crate::dhcp_server::DHCP_SERVER_MAC.0,
-            proxy.vm_mac_address.0,
-        )
-        .ipv4(remote.octets(), local.octets(), 64)
-        .udp(8080, 50000)
-        .write(&mut inbound, b"spoofed source")
-        .unwrap();
-        proxy
-            .process_frame_from_host(&EthernetFrame::new_checked(inbound.as_slice()).unwrap())
+        for source in [remote, overlay] {
+            let mut inbound = Vec::new();
+            PacketBuilder::ethernet2(
+                crate::dhcp_server::DHCP_SERVER_MAC.0,
+                proxy.vm_mac_address.0,
+            )
+            .ipv4(source.octets(), local.octets(), 64)
+            .udp(8080, 50000)
+            .write(&mut inbound, b"spoofed source")
             .unwrap();
-        assert_eq!(
-            guest.recv(&mut [0; 1500]).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+            proxy
+                .process_frame_from_host(&EthernetFrame::new_checked(inbound.as_slice()).unwrap())
+                .unwrap();
+            assert_eq!(
+                guest.recv(&mut [0; 1500]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 }
