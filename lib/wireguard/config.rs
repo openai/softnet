@@ -47,7 +47,8 @@ impl Config {
         // Guest-subnet destinations use ARP and cannot be intercepted by this IP router
         ensure!(
             !self.route.contains(&subnet) && !subnet.contains(&self.route),
-            "WireGuard route must be disjoint from the VM subnet"
+            "WireGuard route {} overlaps VM subnet {subnet}",
+            self.route
         );
 
         Ok(())
