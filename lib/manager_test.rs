@@ -1086,11 +1086,18 @@ async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
         let reply = rpc(&mut peer, "softnet.wireguard.set", config.clone()).await;
         assert!(reply.get("error").is_none(), "{reply}");
         let status = &reply["result"];
+        let public_key = status["publicKey"].as_str().unwrap();
         let listen_port = u16::try_from(status["listenPort"].as_u64().unwrap()).unwrap();
+
+        // Clearing a different VM must leave this tunnel available
+        let other_vm = json!({"vmId": vms[0].vm_id});
+        let reply = rpc(&mut peer, "softnet.wireguard.clear", other_vm).await;
+        assert_eq!(reply["result"], json!({}));
+
         let mut remote_config = wireguard::Config::new(hub.0, "198.18.0.0/24", None).unwrap();
         remote_config.peer = Some(
             wireguard::Peer::new(
-                status["publicKey"].as_str().unwrap().to_owned(),
+                public_key.to_owned(),
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, listen_port),
                 0,
             )
@@ -1116,9 +1123,10 @@ async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
         assert_eq!(&buffer[..length], tcp_ack(overlay, hub, b"outbound"));
 
         // A rejected key and a change to ordinary policy must preserve the live tunnel
-        config["peers"][0]["publicKey"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        config["address"] = json!("198.18.0.99");
-        let reply = rpc(&mut peer, "softnet.wireguard.set", config).await;
+        let mut invalid = config.clone();
+        invalid["peers"][0]["publicKey"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        invalid["address"] = json!("198.18.0.99");
+        let reply = rpc(&mut peer, "softnet.wireguard.set", invalid).await;
         assert_eq!(reply["error"]["code"], CALL_EXECUTION_FAILED_CODE);
         let reply = rpc(
             &mut peer,
@@ -1143,6 +1151,13 @@ async fn native_wireguard_rpc_routes_traffic_for_the_selected_vm() {
                 break;
             }
         }
+
+        // Clear releases the port before replying, and the next set creates a new key
+        let reply = rpc(&mut peer, "softnet.wireguard.clear", json!({"vmId": vm_id})).await;
+        assert_eq!(reply["result"], json!({}));
+        let _old_port = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listen_port)).unwrap();
+        let reply = rpc(&mut peer, "softnet.wireguard.set", config).await;
+        assert_ne!(reply["result"]["publicKey"].as_str().unwrap(), public_key);
     };
 
     timeout(TIMEOUT, async {
@@ -1338,6 +1353,8 @@ async fn native_initialize_drops_credentials_and_rejects_reinitialization() {
             reply["result"],
             json!({"allow": ["@host"], "block": [], "ruleCount": 1})
         );
+        let reply = rpc(&mut control_peer, "softnet.wireguard.clear", json!({})).await;
+        assert_eq!(reply["result"], json!({}));
 
         drop(vm_peer);
         assert_eq!(control_peer.read(&mut [0]).await.unwrap(), 0);

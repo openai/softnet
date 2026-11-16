@@ -89,6 +89,9 @@ pub(crate) enum Request {
         vm_id: Option<Uuid>,
         params: Config,
     },
+    ClearWireGuard {
+        vm_id: Option<Uuid>,
+    },
 }
 
 /// Results of manager operations.
@@ -97,6 +100,7 @@ pub(crate) enum Reply {
     Initialized(Vec<InitializedVm>),
     Policy(Policy),
     WireGuardStatus(Status),
+    WireGuardCleared,
 }
 
 /// Keep invalid parameters distinct from operation failures.
@@ -214,6 +218,14 @@ impl Manager {
                     .wireguard_set(params)
                     .await
                     .map(Reply::WireGuardStatus)
+                    .map_err(CallError::Failed),
+                Err(error) => Err(CallError::InvalidParams(error)),
+            },
+            Request::ClearWireGuard { vm_id } => match self.proxy_handle(vm_id) {
+                Ok(proxy) => proxy
+                    .wireguard_clear()
+                    .await
+                    .map(|()| Reply::WireGuardCleared)
                     .map_err(CallError::Failed),
                 Err(error) => Err(CallError::InvalidParams(error)),
             },
@@ -527,6 +539,13 @@ impl ProxyHandle {
 
         self.request(Command::SetWireGuard { params, reply }, result)
             .await?
+    }
+
+    async fn wireguard_clear(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+
+        self.request(Command::ClearWireGuard { reply }, result)
+            .await
     }
 
     async fn request<T>(&self, command: Command, result: oneshot::Receiver<T>) -> Result<T> {

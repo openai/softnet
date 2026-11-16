@@ -41,6 +41,9 @@ pub(crate) enum Command {
         params: Config,
         reply: oneshot::Sender<Result<Status>>,
     },
+    ClearWireGuard {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -227,6 +230,10 @@ impl Proxy {
                         }
                         Some(Command::SetWireGuard { params, reply }) => {
                             let _ = reply.send(self.wireguard_set(params).await);
+                        }
+                        Some(Command::ClearWireGuard { reply }) => {
+                            self.wireguard = None;
+                            let _ = reply.send(());
                         }
                         None => return Ok(()),
                     }

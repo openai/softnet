@@ -61,7 +61,7 @@ struct VmParams {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-struct GetParams {
+struct TargetParams {
     // Target VM UUID; omission is allowed only for a single-VM initialization
     vm_id: Option<String>,
 }
@@ -158,6 +158,7 @@ impl Control {
                             "ruleCount": policy.rule_count,
                         })),
                         Ok(Reply::WireGuardStatus(status)) => Ok(json!(status)),
+                        Ok(Reply::WireGuardCleared) => Ok(json!({})),
                         Err(CallError::InvalidParams(error)) => {
                             Err(rpc_error(INVALID_PARAMS_CODE, error.to_string()))
                         }
@@ -242,20 +243,9 @@ fn parse_method(
 
             parse_initialize(fds, params)
         }
-        "softnet.policy.get" => {
-            let params = request
-                .params()
-                .parse::<Value>()
-                .and_then(|value| match value {
-                    Value::Null => Ok(GetParams::default()),
-                    Value::Object(_) => request.params().parse::<GetParams>(),
-                    _ => Err(rpc_error(INVALID_PARAMS_CODE, "invalid policy target")),
-                })?;
-
-            Ok(Request::GetPolicy {
-                vm_id: parse_vm_id(params.vm_id)?,
-            })
-        }
+        "softnet.policy.get" => Ok(Request::GetPolicy {
+            vm_id: parse_target(request)?,
+        }),
         "softnet.policy.set" => {
             let params = request.params().parse::<SetParams>()?;
             let vm_id = parse_vm_id(params.vm_id)?;
@@ -286,7 +276,19 @@ fn parse_method(
 
             Ok(Request::SetWireGuard { vm_id, params })
         }
+        "softnet.wireguard.clear" => Ok(Request::ClearWireGuard {
+            vm_id: parse_target(request)?,
+        }),
         _ => Err(rpc_error(METHOD_NOT_FOUND_CODE, "method not found")),
+    }
+}
+
+fn parse_target(request: &RpcRequest<'_>) -> std::result::Result<Option<Uuid>, ErrorObjectOwned> {
+    let params = request.params();
+    match params.parse::<Value>()? {
+        Value::Null => Ok(None),
+        Value::Object(_) => parse_vm_id(params.parse::<TargetParams>()?.vm_id),
+        _ => Err(rpc_error(INVALID_PARAMS_CODE, "expected a VM target")),
     }
 }
 
