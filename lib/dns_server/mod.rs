@@ -23,6 +23,23 @@ pub(crate) const DNS_DOMAIN: &str = "internal";
 /// Standard DNS server port.
 pub(crate) const DNS_PORT: u16 = 53;
 
+/// Parses a VM name that can be registered as `<NAME>.internal`.
+pub fn parse_vm_name(value: &str) -> Result<Name> {
+    let name = Name::from_ascii(value).with_context(|| format!("invalid VM name {value}"))?;
+    validate_vm_name(&name)?;
+
+    Ok(name)
+}
+
+fn validate_vm_name(name: &Name) -> Result<()> {
+    ensure!(
+        !name.is_fqdn() && name.num_labels() == 1 && !name.is_wildcard(),
+        "invalid VM name {name}: expected a single DNS label"
+    );
+
+    Ok(())
+}
+
 pub(crate) struct DnsServer {
     domain: Name,
     catalog: Catalog,
@@ -57,9 +74,7 @@ impl DnsServer {
 
         for (name, address) in records {
             // Validate single-label VM names before checking for duplicates
-            if name.is_fqdn() || name.num_labels() != 1 || name.is_wildcard() {
-                bail!("invalid VM name {name}: expected a single DNS label");
-            }
+            validate_vm_name(&name)?;
 
             if !names.insert(name.clone()) {
                 bail!("VM name {name} is already in use");

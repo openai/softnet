@@ -1,11 +1,11 @@
 use crate::NetType;
 use crate::control_transport::{ControlTransport, Frame};
+use crate::dns_server::parse_vm_name;
 use crate::manager::{Call, CallError, Reply, Request, VmConfig};
 use crate::network::MAX_VMS;
 use crate::proxy::Rule;
 use crate::wireguard::{Config, Peer};
 use anyhow::{Result, ensure};
-use hickory_server::proto::rr::Name;
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request as RpcRequest, Response, ResponsePayload,
     error::{
@@ -387,8 +387,8 @@ fn parse_initialize(
             let name = params
                 .name
                 .map(|name| {
-                    Name::from_ascii(name)
-                        .map_err(|_| rpc_error(INVALID_PARAMS_CODE, "invalid name"))
+                    parse_vm_name(&name)
+                        .map_err(|error| rpc_error(INVALID_PARAMS_CODE, format!("{error:#}")))
                 })
                 .transpose()?;
 

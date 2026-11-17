@@ -56,7 +56,7 @@ struct Args {
     #[clap(
         long,
         requires = "vm_fd",
-        value_parser = |value: &str| Name::from_ascii(value),
+        value_parser = parse_vm_name,
         help = "Single-label VM name to register as <NAME>.internal"
     )]
     vm_name: Option<Name>,
@@ -294,6 +294,10 @@ async fn try_main() -> anyhow::Result<()> {
     result.and(shutdown_result)
 }
 
+fn parse_vm_name(value: &str) -> Result<Name, String> {
+    softnet::parse_vm_name(value).map_err(|err| format!("{err:#}"))
+}
+
 fn parse_vm_fd(value: &str) -> Result<c_int, String> {
     let vm_fd = value
         .parse::<c_int>()
@@ -411,5 +415,33 @@ mod tests {
                 .to_string()
                 .contains("file descriptor must be non-negative")
         );
+    }
+
+    #[test]
+    fn test_cli_rejects_non_single_label_vm_name_before_startup() {
+        for vm_name in ["foo.bar", "foo.", "*", "*.foo"] {
+            let error = Args::try_parse_from([
+                "softnet",
+                "--vm-fd=0",
+                "--vm-mac-address=02:00:00:00:00:01",
+                &format!("--vm-name={vm_name}"),
+            ])
+            .unwrap_err();
+
+            assert!(
+                error.to_string().contains("expected a single DNS label"),
+                "{vm_name}: {error}"
+            );
+        }
+
+        let args = Args::try_parse_from([
+            "softnet",
+            "--vm-fd=0",
+            "--vm-mac-address=02:00:00:00:00:01",
+            "--vm-name=vm1",
+        ])
+        .unwrap();
+
+        assert_eq!(args.vm_name.unwrap().to_ascii(), "vm1");
     }
 }

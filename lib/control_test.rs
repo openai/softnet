@@ -417,6 +417,18 @@ fn rejects_invalid_initialization_and_closes_every_descriptor() {
             1,
         ),
         (
+            json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "name": "foo.bar"}]}),
+            1,
+        ),
+        (
+            json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "name": "foo."}]}),
+            1,
+        ),
+        (
+            json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "name": "*"}]}),
+            1,
+        ),
+        (
             json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02", "allow": ["bad rule"]}]}),
             1,
         ),
