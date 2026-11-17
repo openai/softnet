@@ -3,7 +3,8 @@ use crate::control_transport::{ControlTransport, Frame};
 use crate::manager::{Call, CallError, Reply, Request, VmConfig};
 use crate::network::MAX_VMS;
 use crate::proxy::Rule;
-use anyhow::Result;
+use crate::wireguard::{Config, Peer};
+use anyhow::{Result, ensure};
 use hickory_server::proto::rr::Name;
 use jsonrpsee_types::{
     ErrorObjectOwned, Id, Request as RpcRequest, Response, ResponsePayload,
@@ -14,6 +15,7 @@ use jsonrpsee_types::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -59,7 +61,7 @@ struct VmParams {
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-struct GetParams {
+struct TargetParams {
     // Target VM UUID; omission is allowed only for a single-VM initialization
     vm_id: Option<String>,
 }
@@ -76,6 +78,27 @@ struct SetParams {
 
     // Complete replacement for the VM's packet filter block rules
     block: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WireGuardSetParams {
+    vm_id: Option<String>,
+    address: Ipv4Addr,
+    routes: [String; 1],
+    mtu: Option<u16>,
+    peers: Vec<WireGuardPeerParams>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct WireGuardPeerParams {
+    public_key: String,
+    endpoint: SocketAddrV4,
+    #[serde(rename = "allowedIPs")]
+    allowed_ips: [String; 1],
+    #[serde(default)]
+    persistent_keepalive_seconds: u16,
 }
 
 impl Control {
@@ -134,6 +157,8 @@ impl Control {
                             "block": policy.block.iter().map(ToString::to_string).collect::<Vec<_>>(),
                             "ruleCount": policy.rule_count,
                         })),
+                        Ok(Reply::WireGuardStatus(status)) => Ok(json!(status)),
+                        Ok(Reply::WireGuardCleared) => Ok(json!({})),
                         Err(CallError::InvalidParams(error)) => {
                             Err(rpc_error(INVALID_PARAMS_CODE, error.to_string()))
                         }
@@ -218,20 +243,9 @@ fn parse_method(
 
             parse_initialize(fds, params)
         }
-        "softnet.policy.get" => {
-            let params = request
-                .params()
-                .parse::<Value>()
-                .and_then(|value| match value {
-                    Value::Null => Ok(GetParams::default()),
-                    Value::Object(_) => request.params().parse::<GetParams>(),
-                    _ => Err(rpc_error(INVALID_PARAMS_CODE, "invalid policy target")),
-                })?;
-
-            Ok(Request::GetPolicy {
-                vm_id: parse_vm_id(params.vm_id)?,
-            })
-        }
+        "softnet.policy.get" => Ok(Request::GetPolicy {
+            vm_id: parse_target(request)?,
+        }),
         "softnet.policy.set" => {
             let params = request.params().parse::<SetParams>()?;
             let vm_id = parse_vm_id(params.vm_id)?;
@@ -243,8 +257,66 @@ fn parse_method(
                 block,
             })
         }
+        "softnet.wireguard.set" => {
+            let params = request.params();
+            if !params.is_object() {
+                return Err(rpc_error(INVALID_PARAMS_CODE, "expected an object"));
+            }
+
+            let WireGuardSetParams {
+                vm_id,
+                address,
+                routes: [route],
+                mtu,
+                peers,
+            } = params.parse()?;
+            let vm_id = parse_vm_id(vm_id)?;
+            let params = parse_wireguard_config(address, &route, mtu, peers)
+                .map_err(|error| rpc_error(INVALID_PARAMS_CODE, error.to_string()))?;
+
+            Ok(Request::SetWireGuard { vm_id, params })
+        }
+        "softnet.wireguard.clear" => Ok(Request::ClearWireGuard {
+            vm_id: parse_target(request)?,
+        }),
         _ => Err(rpc_error(METHOD_NOT_FOUND_CODE, "method not found")),
     }
+}
+
+fn parse_target(request: &RpcRequest<'_>) -> std::result::Result<Option<Uuid>, ErrorObjectOwned> {
+    let params = request.params();
+    match params.parse::<Value>()? {
+        Value::Null => Ok(None),
+        Value::Object(_) => parse_vm_id(params.parse::<TargetParams>()?.vm_id),
+        _ => Err(rpc_error(INVALID_PARAMS_CODE, "expected a VM target")),
+    }
+}
+
+fn parse_wireguard_config(
+    address: Ipv4Addr,
+    route: &str,
+    mtu: Option<u16>,
+    peers: Vec<WireGuardPeerParams>,
+) -> Result<Config> {
+    let mut config = Config::new(address, route, mtu)?;
+    let mut peers = peers.into_iter();
+    if let Some(peer) = peers.next() {
+        ensure!(
+            peers.next().is_none(),
+            "Softnet currently supports at most one WireGuard peer"
+        );
+        ensure!(
+            peer.allowed_ips == [route],
+            "peer allowedIPs must equal routes"
+        );
+        config.peer = Some(Peer::new(
+            peer.public_key,
+            peer.endpoint,
+            peer.persistent_keepalive_seconds,
+        )?);
+    }
+
+    Ok(config)
 }
 
 fn parse_vm_id(vm_id: Option<String>) -> std::result::Result<Option<Uuid>, ErrorObjectOwned> {

@@ -5,18 +5,22 @@ mod rule;
 mod rules;
 mod vm;
 
-use crate::dhcp_server::DhcpServer;
+use crate::dhcp_server::{DHCP_SERVER_MAC, DhcpServer};
 use crate::dns_server::DnsServer;
 use crate::host::Host;
 use crate::network::Network;
 use crate::vm::VM;
+use crate::wireguard::{Config, Status, WireGuard};
 use anyhow::Result;
 pub use exposed_port::ExposedPort;
 use flows::{FlowTable, PendingFlow};
+use futures_util::future::OptionFuture;
 use mac_address::MacAddress;
 pub use rule::{Direction, Filter, PortRange, Protocol, Rule, Target};
 pub(crate) use rules::{PolicyDecision, Rules};
-use smoltcp::wire::{EthernetAddress, EthernetFrame, Ipv4Packet};
+use smoltcp::wire::{
+    ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, Ipv4Packet,
+};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +36,13 @@ pub(crate) enum Command {
         allow: Vec<Rule>,
         block: Vec<Rule>,
         reply: oneshot::Sender<Policy>,
+    },
+    SetWireGuard {
+        params: Config,
+        reply: oneshot::Sender<Result<Status>>,
+    },
+    ClearWireGuard {
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -49,6 +60,8 @@ pub struct Proxy {
     peer_ips: Vec<Ipv4Addr>,
     dhcp_server: DhcpServer,
     dns_server: Option<Arc<DnsServer>>,
+    wireguard: Option<WireGuard>,
+    subnet: ipnet::Ipv4Net,
     rules: Rules,
     allow: Vec<Rule>,
     block: Vec<Rule>,
@@ -103,6 +116,8 @@ impl Proxy {
             peer_ips,
             dhcp_server,
             dns_server,
+            wireguard: None,
+            subnet: network.subnet,
             rules,
             allow,
             block,
@@ -112,19 +127,22 @@ impl Proxy {
     }
 
     pub(crate) async fn run(&mut self, mut commands_rx: mpsc::Receiver<Command>) -> Result<()> {
+        let max_packet_size = self.host.max_packet_size as usize;
+        let vm_ip = self.host.vm_ip;
+
         // Create a single buffer from reading from the VM
-        let mut buf: Vec<u8> = vec![0; self.host.max_packet_size as usize];
+        let mut buf: Vec<u8> = vec![0; max_packet_size];
 
         // Create multiple buffers and a batch for reading from the host
-        let mut bufs = vec![
-            vec![0u8; self.host.max_packet_size as usize];
-            self.host.read_max_packets as usize
-        ];
+        let mut bufs = vec![vec![0u8; max_packet_size]; self.host.read_max_packets as usize];
         let mut batch = Batch::preallocate(bufs.len());
 
         // Check VM connectivity periodically, skipping missed ticks
         let mut maintenance = interval(Duration::from_millis(100));
         maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Reserve space for the Ethernet header before the WireGuard IPv4 payload
+        let mut wireguard_buf = vec![0; max_packet_size];
 
         // Service packet I/O, policy changes, and maintenance on the same runtime
         loop {
@@ -210,7 +228,44 @@ impl Proxy {
                         Some(Command::PolicySet { allow, block, reply }) => {
                             let _ = reply.send(self.policy_set(allow, block));
                         }
+                        Some(Command::SetWireGuard { params, reply }) => {
+                            let _ = reply.send(self.wireguard_set(params).await);
+                        }
+                        Some(Command::ClearWireGuard { reply }) => {
+                            self.wireguard = None;
+                            let _ = reply.send(());
+                        }
                         None => return Ok(()),
+                    }
+                }
+
+                Some(result) = OptionFuture::from(self.wireguard.as_mut().map(|wireguard| {
+                    wireguard.receive_vm_ipv4(&mut wireguard_buf[ETHERNET_HEADER_LEN..], vm_ip)
+                })) => {
+                    let Some(length) = result? else {
+                        // Return to select after dropping a tunnel packet
+                        continue;
+                    };
+
+                    // Update the coarse time once the packet arrives
+                    coarsetime::Instant::update();
+
+                    // Rebuild the Ethernet frame for delivery to the VM
+                    let frame = &mut wireguard_buf[..ETHERNET_HEADER_LEN + length];
+                    let mut ethernet = EthernetFrame::new_unchecked(&mut frame[..]);
+                    ethernet.set_ethertype(EthernetProtocol::Ipv4);
+                    ethernet.set_src_addr(DHCP_SERVER_MAC);
+                    ethernet.set_dst_addr(self.vm_mac_address);
+
+                    if let Err(error) = self.write_to_vm(frame) {
+                        // Treat peer closure as normal VM shutdown
+                        if let Some(io_error) = error.downcast_ref::<std::io::Error>()
+                            && self.vm.is_disconnect(io_error)?
+                        {
+                            return Ok(());
+                        }
+
+                        return Err(error);
                     }
                 }
 
@@ -272,6 +327,20 @@ impl Proxy {
         }
 
         self.policy_get()
+    }
+
+    async fn wireguard_set(&mut self, config: Config) -> Result<Status> {
+        config.validate(self.subnet)?;
+
+        let wireguard = match &mut self.wireguard {
+            Some(wireguard) => {
+                wireguard.apply(config)?;
+                wireguard
+            }
+            slot @ None => slot.insert(WireGuard::new(config).await?),
+        };
+
+        Ok(wireguard.status())
     }
 
     pub(crate) fn finalize(&mut self) -> Result<()> {
@@ -581,5 +650,76 @@ mod tests {
         udp.set_dst_port(dst_port);
         udp.set_len(8);
         bytes
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reserved_wireguard_addresses_cannot_use_vmnet_in_either_direction() {
+        use crate::wireguard::Config;
+        use etherparse::PacketBuilder;
+        use smoltcp::wire::EthernetFrame;
+        use std::os::unix::net::UnixDatagram;
+
+        let (mut proxy, peer) = create_proxy(vec!["0.0.0.0/0"], vec![]);
+        let guest = UnixDatagram::from(peer);
+        guest.set_nonblocking(true).unwrap();
+        let overlay = Ipv4Address::new(198, 18, 1, 2);
+        let remote = Ipv4Address::new(198, 18, 0, 2);
+        let route = "198.18.0.2/32";
+        proxy
+            .wireguard_set(Config::new(overlay, route, None).unwrap())
+            .await
+            .unwrap();
+
+        // Reject a local overlay address that collides with the vmnet gateway
+        let gateway = proxy.host.gateway_ip;
+        let error = proxy
+            .wireguard_set(Config::new(gateway, route, None).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "WireGuard address {gateway} belongs to VM subnet {}",
+                proxy.subnet
+            )
+        );
+
+        let local = proxy.host.vm_ip;
+
+        // Keep both addresses out of vmnet even under a permissive egress policy
+        for destination in [remote, overlay] {
+            let outbound = udp_packet(local, 50_000, destination, 8080);
+            assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+        }
+
+        // Non-tunnel destinations still follow ordinary policy and require the VM source address
+        let ordinary = Ipv4Address::new(203, 0, 113, 2);
+        let outbound = udp_packet(local, 50_000, ordinary, 8080);
+        assert!(allows_vm_packet(&mut proxy, &outbound).await);
+        let spoofed = udp_packet(remote, 50_000, ordinary, 8080);
+        assert!(!allows_vm_packet(&mut proxy, &spoofed).await);
+        proxy.policy_set(vec![], vec!["0.0.0.0/0".parse().unwrap()]);
+        assert!(!allows_vm_packet(&mut proxy, &outbound).await);
+
+        // Ordinary inbound frames cannot impersonate a source reserved for authenticated traffic
+        for source in [remote, overlay] {
+            let mut inbound = Vec::new();
+            PacketBuilder::ethernet2(
+                crate::dhcp_server::DHCP_SERVER_MAC.0,
+                proxy.vm_mac_address.0,
+            )
+            .ipv4(source.octets(), local.octets(), 64)
+            .udp(8080, 50000)
+            .write(&mut inbound, b"spoofed source")
+            .unwrap();
+            proxy
+                .process_frame_from_host(&EthernetFrame::new_checked(inbound.as_slice()).unwrap())
+                .unwrap();
+            assert_eq!(
+                guest.recv(&mut [0; 1500]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 }

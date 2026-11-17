@@ -5,6 +5,7 @@ use crate::network::{MAX_VMS, NetType, Network, SUBNET_PREFIX_LEN};
 use crate::proxy::{Command, ExposedPort, Policy, Proxy, Rule};
 use crate::subnet_finder;
 use crate::vm::VM;
+use crate::wireguard::{Config, Status};
 use anyhow::{Context, Result, ensure};
 use futures_util::FutureExt;
 use futures_util::future::OptionFuture;
@@ -84,6 +85,13 @@ pub(crate) enum Request {
         allow: Vec<Rule>,
         block: Vec<Rule>,
     },
+    SetWireGuard {
+        vm_id: Option<Uuid>,
+        params: Config,
+    },
+    ClearWireGuard {
+        vm_id: Option<Uuid>,
+    },
 }
 
 /// Results of manager operations.
@@ -91,6 +99,8 @@ pub(crate) enum Request {
 pub(crate) enum Reply {
     Initialized(Vec<InitializedVm>),
     Policy(Policy),
+    WireGuardStatus(Status),
+    WireGuardCleared,
 }
 
 /// Keep invalid parameters distinct from operation failures.
@@ -200,6 +210,22 @@ impl Manager {
                     .policy_set(allow, block)
                     .await
                     .map(Reply::Policy)
+                    .map_err(CallError::Failed),
+                Err(error) => Err(CallError::InvalidParams(error)),
+            },
+            Request::SetWireGuard { vm_id, params } => match self.proxy_handle(vm_id) {
+                Ok(proxy) => proxy
+                    .wireguard_set(params)
+                    .await
+                    .map(Reply::WireGuardStatus)
+                    .map_err(CallError::Failed),
+                Err(error) => Err(CallError::InvalidParams(error)),
+            },
+            Request::ClearWireGuard { vm_id } => match self.proxy_handle(vm_id) {
+                Ok(proxy) => proxy
+                    .wireguard_clear()
+                    .await
+                    .map(|()| Reply::WireGuardCleared)
                     .map_err(CallError::Failed),
                 Err(error) => Err(CallError::InvalidParams(error)),
             },
@@ -508,7 +534,21 @@ impl ProxyHandle {
         .await
     }
 
-    async fn request(&self, command: Command, result: oneshot::Receiver<Policy>) -> Result<Policy> {
+    async fn wireguard_set(&self, params: Config) -> Result<Status> {
+        let (reply, result) = oneshot::channel();
+
+        self.request(Command::SetWireGuard { params, reply }, result)
+            .await?
+    }
+
+    async fn wireguard_clear(&self) -> Result<()> {
+        let (reply, result) = oneshot::channel();
+
+        self.request(Command::ClearWireGuard { reply }, result)
+            .await
+    }
+
+    async fn request<T>(&self, command: Command, result: oneshot::Receiver<T>) -> Result<T> {
         self.commands
             .send(command)
             .await

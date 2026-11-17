@@ -3,6 +3,7 @@ use crate::control_transport::Frame;
 use crate::manager::{Call, InitializedVm, Reply, Request};
 use crate::network::{MAX_VMS, NetType};
 use crate::proxy::Policy;
+use crate::wireguard::Peer;
 use jsonrpsee_types::error::{
     INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
 };
@@ -116,6 +117,37 @@ async fn rejects_invalid_requests_without_dispatching_them() {
         (extra, INVALID_REQUEST_CODE),
         (request("unknown", Value::Null), METHOD_NOT_FOUND_CODE),
         (
+            request("softnet.wireguard.set", json!({})),
+            INVALID_PARAMS_CODE,
+        ),
+        (
+            request(
+                "softnet.wireguard.set",
+                json!([null, "10.77.0.2", ["10.77.0.0/24"], []]),
+            ),
+            INVALID_PARAMS_CODE,
+        ),
+        (
+            request(
+                "softnet.wireguard.set",
+                json!({
+                    "address": "10.77.0.2", "routes": ["10.77.0.0/24"],
+                    "peers": [], "unrecognized": true,
+                }),
+            ),
+            INVALID_PARAMS_CODE,
+        ),
+        (
+            request(
+                "softnet.wireguard.set",
+                json!({
+                    "vmId": 5, "address": "10.77.0.2",
+                    "routes": ["10.77.0.0/24"], "peers": [],
+                }),
+            ),
+            INVALID_PARAMS_CODE,
+        ),
+        (
             request(
                 "softnet.initialize",
                 json!({"vms": [{"vmMacAddress": "02:00:00:00:00:02"}]}),
@@ -145,6 +177,100 @@ async fn rejects_invalid_requests_without_dispatching_them() {
     }
     drop(control_calls_rx);
     control.await.unwrap();
+}
+
+#[test]
+fn parses_flat_wireguard_params_with_optional_vm_id() {
+    let vm_id = Uuid::from_u128(1);
+    for (selector, expected) in [
+        (None, None),
+        (Some(Value::Null), None),
+        (Some(json!(vm_id)), Some(vm_id)),
+    ] {
+        let mut params = json!({"address": "10.77.0.2", "routes": ["10.77.0.0/24"], "peers": []});
+        if let Some(selector) = selector {
+            params["vmId"] = selector;
+        }
+
+        let frame = Frame {
+            line: Ok(request("softnet.wireguard.set", params).to_string()),
+            fds: vec![],
+        };
+        let (_, request) = Control::parse(frame).unwrap();
+        let Request::SetWireGuard { vm_id, params } = request else {
+            panic!("expected a WireGuard set request");
+        };
+        assert_eq!(vm_id, expected);
+        assert_eq!(params.route, "10.77.0.0/24".parse().unwrap());
+        assert!(params.peer.is_none());
+        assert_eq!(params.mtu, None);
+    }
+}
+
+#[test]
+fn validates_wireguard_set_params() {
+    let public_key = "3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=";
+    let endpoint = "192.0.2.1:30000";
+    let desired = json!({
+        "address": "10.77.1.2",
+        "mtu": 1380,
+        "peers": [{
+            "publicKey": public_key,
+            "endpoint": endpoint,
+            "allowedIPs": ["10.77.0.0/16"],
+            "persistentKeepaliveSeconds": 15
+        }],
+        "routes": ["10.77.0.0/16"]
+    });
+    let parse_config = |params| {
+        let frame = Frame {
+            line: Ok(request("softnet.wireguard.set", params).to_string()),
+            fds: vec![],
+        };
+        let (_, request) = Control::parse(frame)?;
+        let Request::SetWireGuard { params, .. } = request else {
+            panic!("expected a WireGuard set request");
+        };
+
+        Ok::<_, Value>(params)
+    };
+    let config = parse_config(desired.clone()).unwrap();
+    config.validate("192.168.64.0/24".parse().unwrap()).unwrap();
+    assert_eq!(config.mtu, Some(1380));
+    assert_eq!(
+        config.peer,
+        Some(Peer::new(public_key.to_owned(), endpoint.parse().unwrap(), 15).unwrap())
+    );
+
+    for (case, field, value) in [
+        ("null address", "address", json!(null)),
+        ("loopback address", "address", json!("127.0.0.1")),
+        ("MTU below IPv4 minimum", "mtu", json!(67)),
+        ("MTU exceeds UDP ceiling", "mtu", json!(65_476)),
+        ("empty routes", "routes", json!([])),
+        (
+            "multiple routes",
+            "routes",
+            json!(["10.77.0.0/16", "10.78.0.0/16"]),
+        ),
+        ("route to local address", "routes", json!(["10.77.1.2/32"])),
+        ("leading-zero prefix", "routes", json!(["10.77.0.0/016"])),
+        ("route with host bits", "routes", json!(["10.77.1.0/16"])),
+        ("allowedIPs mismatch", "routes", json!(["10.77.2.0/24"])),
+        (
+            "multiple peers",
+            "peers",
+            json!([desired["peers"][0], desired["peers"][0]]),
+        ),
+    ] {
+        let mut invalid = desired.clone();
+        invalid[field] = value;
+        assert!(parse_config(invalid).is_err(), "{case}");
+    }
+
+    let mut missing_routes = desired;
+    missing_routes.as_object_mut().unwrap().remove("routes");
+    assert!(parse_config(missing_routes).is_err(), "missing routes");
 }
 
 #[tokio::test]
