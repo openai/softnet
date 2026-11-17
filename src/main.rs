@@ -1,6 +1,7 @@
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use hickory_server::proto::rr::Name;
+use ipnet::Ipv4Net;
 use log::LevelFilter;
 use oslog::OsLogger;
 use softnet::NetType;
@@ -70,6 +71,16 @@ struct Args {
         default_value_t = 600
     )]
     bootpd_lease_time: u32,
+
+    #[clap(
+        long,
+        value_parser = parse_subnet_pool,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+        value_name = "CIDR",
+        help = "private IPv4 CIDR(s) from which to allocate the guest /29 subnet"
+    )]
+    subnet_pool: Vec<Ipv4Net>,
 
     #[clap(long, help = "user name to drop privileges to")]
     user: Option<String>,
@@ -260,7 +271,8 @@ async fn try_main() -> anyhow::Result<()> {
         args.user.unwrap_or(current_user_name),
         args.group.unwrap_or(current_group_name),
         control,
-    );
+    )
+    .with_subnet_pool(args.subnet_pool);
 
     // Run the manager until it finishes or the process receives SIGINT
     let mut interrupt = signal(SignalKind::interrupt())?;
@@ -304,6 +316,22 @@ fn parse_vm_fd(value: &str) -> Result<c_int, String> {
     }
 
     Ok(vm_fd)
+}
+
+fn parse_subnet_pool(value: &str) -> Result<Ipv4Net, String> {
+    let subnet = value
+        .parse::<Ipv4Net>()
+        .map_err(|error| format!("invalid subnet pool: {error}"))?;
+
+    if !subnet.network().is_private() || !subnet.broadcast().is_private() {
+        return Err("subnet pool must be entirely within private IPv4 address space".to_string());
+    }
+
+    if subnet.prefix_len() > 29 {
+        return Err("subnet pool must be large enough to contain a /29".to_string());
+    }
+
+    Ok(subnet)
 }
 
 fn sudo_escalation_works() -> bool {
@@ -411,5 +439,43 @@ mod tests {
                 .to_string()
                 .contains("file descriptor must be non-negative")
         );
+    }
+
+    #[test]
+    fn test_cli_accepts_repeated_and_comma_separated_subnet_pools() {
+        let args = Args::try_parse_from([
+            "softnet",
+            "--control-fd=0",
+            "--subnet-pool=10.20.0.0/16,172.20.0.0/16",
+            "--subnet-pool=192.168.64.0/18",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.subnet_pool,
+            [
+                "10.20.0.0/16".parse().unwrap(),
+                "172.20.0.0/16".parse().unwrap(),
+                "192.168.64.0/18".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cli_rejects_public_subnet_pool() {
+        let error =
+            Args::try_parse_from(["softnet", "--control-fd=0", "--subnet-pool=203.0.113.0/24"])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("private IPv4 address space"));
+    }
+
+    #[test]
+    fn test_cli_rejects_subnet_pool_smaller_than_guest_subnet() {
+        let error =
+            Args::try_parse_from(["softnet", "--control-fd=0", "--subnet-pool=10.20.30.0/30"])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("large enough to contain a /29"));
     }
 }
