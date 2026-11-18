@@ -4,6 +4,7 @@ mod dhcp_server;
 mod dns_server;
 mod host;
 mod network;
+pub use dns_server::is_valid_vm_name;
 pub use network::NetType;
 pub mod manager;
 pub mod proxy;
